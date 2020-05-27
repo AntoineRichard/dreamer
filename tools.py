@@ -25,7 +25,7 @@ class Module(tf.Module):
   def save(self, filename):
     values = tf.nest.map_structure(lambda x: x.numpy(), self.variables)
     with pathlib.Path(filename).open('wb') as f:
-      pickle.dump(values, f)
+      pickle.dump(values, f, protocol=2)
 
   def load(self, filename):
     with pathlib.Path(filename).open('rb') as f:
@@ -128,6 +128,8 @@ def simulate(agent, envs, steps=0, episodes=0, state=None):
     length += 1
     step += (done * length).sum()
     length *= (1 - done)
+  print(episodes)
+  print(episode)
   # Return new state to allow resuming the simulation.
   return (step - steps, episode - episodes, done, length, obs, agent_state)
 

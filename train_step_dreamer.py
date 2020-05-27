@@ -14,7 +14,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.mixed_precision import experimental as prec
 
-tf.get_logger().setLevel('DEBUG')
+tf.get_logger().setLevel('ERROR')
 
 from tensorflow_probability import distributions as tfd
 
@@ -23,7 +23,6 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 import models
 import tools
 import wrappers
-
 
 def define_config():
   config = tools.AttrDict()
@@ -109,15 +108,10 @@ class Dreamer(tools.Module):
 
   def __call__(self, obs, reset, state=None, training=True):
     step = self._step.numpy().item()
-    #print('step: ',step, 'reset', reset, 'training: ', training)
     tf.summary.experimental.set_step(step)
-    #print(state)
     if state is not None and reset.any():
       mask = tf.cast(1 - reset, self._float)[:, None]
       state = tf.nest.map_structure(lambda x: x * mask, state)
-    #print(state)
-    #print(obs)
-    #print(reset)
     if self._should_train(step):
       log = self._should_log(step)
       n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
@@ -330,7 +324,6 @@ class Dreamer(tools.Module):
     print(f'[{step}]', ' / '.join(f'{k} {v:.1f}' for k, v in metrics))
     self._writer.flush()
 
-
 def preprocess(obs, config):
   dtype = prec.global_policy().compute_dtype
   obs = obs.copy()
@@ -360,10 +353,7 @@ def load_dataset(directory, config):
 
 
 def summarize_episode(episode, config, datadir, writer, prefix):
-  #print('in summarize_episode: ', episode)
-  print(episode)
   episodes, steps = tools.count_episodes(datadir)
-  print(episodes,steps)
   length = (len(episode['reward']) - 1) * config.action_repeat
   ret = episode['reward'].sum()
   print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
@@ -424,53 +414,147 @@ def main(config):
   train_envs = [wrappers.Async(lambda: make_env(
       config, writer, 'train', datadir, store=True), config.parallel)
       for _ in range(config.envs)]
-  test_envs = [wrappers.Async(lambda: make_env(
-      config, writer, 'test', datadir, store=False), config.parallel)
-      for _ in range(config.envs)]
+  #test_envs = [wrappers.Async(lambda: make_env(
+  #    config, writer, 'test', datadir, store=False), config.parallel)
+  #    for _ in range(config.envs)]
   actspace = train_envs[0].action_space
-
+  #print(actspace)
+  #exit(0)
   # Prefill dataset with random episodes.
   step = count_steps(datadir, config)
-  prefill = max(0, config.prefill - step)
-  print(f'Prefill dataset with {prefill} steps.')
-  random_agent = lambda o, d, _: ([actspace.sample() for _ in d], None)
-  tools.simulate(random_agent, train_envs, prefill / config.action_repeat)
+  #prefill = max(0, config.prefill - step)
+  #print(f'Prefill dataset with {prefill} steps.')
+  #random_agent = lambda o, d, _: ([actspace.sample() for _ in d], None)
+  #tools.simulate(random_agent, train_envs, prefill / config.action_repeat)
   writer.flush()
 
-  #path = '/mnt/nvme-storage/antoine/DREAMER/dreamer/logdir/turtle_sim/dreamer/1/episodes/'
-
-
   # Train and regularly evaluate the agent.
-  step = count_steps(datadir, config)
-  print(f'Simulating agent for {config.steps-step} steps.')
+  #step = count_steps(datadir, config)
+  #print(f'Simulating agent for {config.steps-step} steps.')
   agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Load checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
-  state = None
-  #import os
-  #training = True
-  #files = os.listdir(str(datadir))
-  #keys = ['image','reward']
-  #for i in range(len(files)):
-  #    print(i)
-  #    episode = np.load(str(datadir)+'/'+files[i])
-  #    episode = {k: episode[k] for k in episode.keys()}
-  #    state=None
-  #    for i in range(500):
-  #        obs = {k: [episode[k][i]] for k in keys}
-  #        action, state = agent(obs, np.array([False]), state, training)
-  while step < config.steps:
-    print('Start evaluation.')
-    tools.simulate(
-        functools.partial(agent, training=False), test_envs, episodes=1)
-    writer.flush()
-    print('Start collection.')
-    steps = config.eval_every // config.action_repeat
-    state = tools.simulate(agent, train_envs, steps, state=state)
-    step = count_steps(datadir, config)
-    agent.save(config.logdir / 'variables.pkl')
-  for env in train_envs + test_envs:
+  print('Trying manual steps')
+  training=False
+  episode = np.load('/mnt/nvme-storage/antoine/DREAMER/dreamer/logdir/dmc_walker_walk/dreamer/1/episodes/20200505T170850-fdfb6c050e364a40a22d5255a5519e70-501.npz')
+  episode = {k: episode[k] for k in episode.keys()}
+  state=None
+  keys = ['orientations','height','velocity','image','reward']
+  obs = {k: [episode[k][0]] for k in keys}
+  # Alternate between train env steps and test env steps
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  reset = [False]
+  #if state is not None and reset.any():
+  #      mask = tf.cast(1 - reset, self._float)[:, None]
+  #      state = tf.nest.map_structure(lambda x: x * mask, state)
+  obs = {k: [episode[k][1]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][2]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][3]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][4]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][5]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][6]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][7]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][8]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][9]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][10]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][11]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][12]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][13]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  obs = {k: [episode[k][14]] for k in keys}
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  print('Benching')
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  print('Force Reload')
+  if (config.logdir / 'variables.pkl').exists():
+    print('Load checkpoint.')
+    agent.load(config.logdir / 'variables.pkl')
+  print('Benching')
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  print('Force Reload')
+  if (config.logdir / 'variables.pkl').exists():
+    print('Load checkpoint.')
+    agent.load(config.logdir / 'variables.pkl')
+  print('Benching')
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  action, state = agent.policy(obs, state, training)
+  print('Manual step OK')
+  # When performing training steps increment agent._step
+  #if training:
+  #  agent._step.assign_add(len(reset) * agent._c.action_repeat)
+
+
+  # when done with steps of agent
+  #tools.save_episodes(datadir, [ep])
+  #summarize_episode(ep, config, datadir, writer, prefix)
+
+
+
+
+  #while step < config.steps:
+  #  print('Start evaluation.')
+  #  tools.simulate(
+  #      functools.partial(agent, training=False), test_envs, episodes=1)
+  #  writer.flush()
+  #  print('Start collection.')
+  #  steps = config.eval_every // config.action_repeat
+  #  state = tools.simulate(agent, train_envs, steps, state=state)
+  #  step = count_steps(datadir, config)
+  #  agent.save(config.logdir / 'variables.pkl')
+  for env in train_envs:# + test_envs:
     env.close()
 
 

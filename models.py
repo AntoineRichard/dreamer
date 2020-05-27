@@ -27,16 +27,16 @@ class RSSM(tools.Module):
 
   @tf.function
   def observe(self, embed, action, state=None):
-    if state is None:
+    if state is None: # No state --> set state to 0
       state = self.initial(tf.shape(action)[0])
-    embed = tf.transpose(embed, [1, 0, 2])
-    action = tf.transpose(action, [1, 0, 2])
+    embed = tf.transpose(embed, [1, 0, 2]) # BS,Length,Feat --> Length, BS, feat
+    action = tf.transpose(action, [1, 0, 2]) # BS,Length,Feat --> Length, BS, feat
     post, prior = tools.static_scan(
-        lambda prev, inputs: self.obs_step(prev[0], *inputs),
-        (action, embed), (state, state))
-    post = {k: tf.transpose(v, [1, 0, 2]) for k, v in post.items()}
-    prior = {k: tf.transpose(v, [1, 0, 2]) for k, v in prior.items()}
-    return post, prior
+        lambda prev, inputs: self.obs_step(prev[0], *inputs), # transforms the data to state, action, embed
+        (action, embed), (state, state)) # Applies obs_step to each element of the sequence in a batch fashion
+    post = {k: tf.transpose(v, [1, 0, 2]) for k, v in post.items()} # Undo previous transpose
+    prior = {k: tf.transpose(v, [1, 0, 2]) for k, v in prior.items()} # Undo previous transpose
+    return post, prior #post : (state,state), prior:
 
   @tf.function
   def imagine(self, action, state=None):

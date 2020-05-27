@@ -3,18 +3,22 @@ import collections
 import functools
 import json
 import os
+import glob
 import pathlib
 import sys
 import time
+import http.client
+from bottle import Bottle, request
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['MUJOCO_GL'] = 'egl'
 
+import gym
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.mixed_precision import experimental as prec
 
-tf.get_logger().setLevel('DEBUG')
+tf.get_logger().setLevel('ERROR')
 
 from tensorflow_probability import distributions as tfd
 
@@ -24,14 +28,13 @@ import models
 import tools
 import wrappers
 
-
 def define_config():
   config = tools.AttrDict()
   # General.
   config.logdir = pathlib.Path('.')
   config.seed = 0
   config.steps = 5e6
-  config.eval_every = 1e4
+  config.eval_every = 5000
   config.log_every = 1e3
   config.log_scalars = True
   config.log_images = True
@@ -41,7 +44,7 @@ def define_config():
   config.task = 'dmc_walker_walk'
   config.envs = 1
   config.parallel = 'none'
-  config.action_repeat = 2
+  config.action_repeat = 1
   config.time_limit = 1000
   config.prefill = 5000
   config.eval_noise = 0.0
@@ -101,37 +104,32 @@ class Dreamer(tools.Module):
     self._metrics = collections.defaultdict(tf.metrics.Mean)
     self._metrics['expl_amount']  # Create variable for checkpoint.
     self._float = prec.global_policy().compute_dtype
-    self._strategy = tf.distribute.MirroredStrategy()
-    with self._strategy.scope():
-      self._dataset = iter(self._strategy.experimental_distribute_dataset(
-          load_dataset(datadir, self._c)))
-      self._build_model()
+    #self._strategy = tf.distribute.MirroredStrategy()
+    #with self._strategy.scope():
+    #  self._dataset = iter#(self._strategy.experimental_distribute_dataset(
+    self._dataset = iter(load_dataset(datadir, self._c))
+    self._build_model()
 
-  def __call__(self, obs, reset, state=None, training=True):
-    step = self._step.numpy().item()
-    #print('step: ',step, 'reset', reset, 'training: ', training)
-    tf.summary.experimental.set_step(step)
-    #print(state)
-    if state is not None and reset.any():
-      mask = tf.cast(1 - reset, self._float)[:, None]
-      state = tf.nest.map_structure(lambda x: x * mask, state)
-    #print(state)
-    #print(obs)
-    #print(reset)
-    if self._should_train(step):
-      log = self._should_log(step)
-      n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
-      print(f'Training for {n} steps.')
-      with self._strategy.scope():
-        for train_step in range(n):
-          log_images = self._c.log_images and log and train_step == 0
-          self.train(next(self._dataset), log_images)
-      if log:
-        self._write_summaries()
-    action, state = self.policy(obs, state, training)
-    if training:
-      self._step.assign_add(len(reset) * self._c.action_repeat)
-    return action, state
+  #def __call__(self, obs, reset, state=None, training=True):
+  #  step = self._step.numpy().item()
+  #  tf.summary.experimental.set_step(step)
+  #  if state is not None and reset.any():
+  #    mask = tf.cast(1 - reset, self._float)[:, None]
+  #    state = tf.nest.map_structure(lambda x: x * mask, state)
+  #  if self._should_train(step):
+  #    log = self._should_log(step)
+  #    n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
+  #    print(f'Training for {n} steps.')
+  #    #with self._strategy.scope():
+  #      #for train_step in range(n):
+  #        #log_images = self._c.log_images and log and train_step == 0
+  #        #self.train(next(self._dataset), log_images)
+  #    if log:
+  #      #self._write_summaries()
+  #  action, state = self.policy(obs, state, training)
+  #  if training:
+  #    self._step.assign_add(len(reset) * self._c.action_repeat)
+  #  return action, state
 
   @tf.function
   def policy(self, obs, state, training):
@@ -157,7 +155,8 @@ class Dreamer(tools.Module):
 
   @tf.function()
   def train(self, data, log_images=False):
-    self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+    #self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+    self._train(data, log_images)
 
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
@@ -179,7 +178,7 @@ class Dreamer(tools.Module):
       div = tf.reduce_mean(tfd.kl_divergence(post_dist, prior_dist))
       div = tf.maximum(div, self._c.free_nats)
       model_loss = self._c.kl_scale * div - sum(likes.values())
-      model_loss /= float(self._strategy.num_replicas_in_sync)
+      #model_loss /= float(self._strategy.num_replicas_in_sync)
 
     with tf.GradientTape() as actor_tape:
       imag_feat = self._imagine_ahead(post)
@@ -195,26 +194,27 @@ class Dreamer(tools.Module):
       discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
           [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
       actor_loss = -tf.reduce_mean(discount * returns)
-      actor_loss /= float(self._strategy.num_replicas_in_sync)
+      #actor_loss /= float(self._strategy.num_replicas_in_sync)
 
     with tf.GradientTape() as value_tape:
       value_pred = self._value(imag_feat)[:-1]
       target = tf.stop_gradient(returns)
       value_loss = -tf.reduce_mean(discount * value_pred.log_prob(target))
-      value_loss /= float(self._strategy.num_replicas_in_sync)
+      #value_loss /= float(self._strategy.num_replicas_in_sync)
 
     model_norm = self._model_opt(model_tape, model_loss)
     actor_norm = self._actor_opt(actor_tape, actor_loss)
     value_norm = self._value_opt(value_tape, value_loss)
 
-    if tf.distribute.get_replica_context().replica_id_in_sync_group == 0:
-      if self._c.log_scalars:
-        self._scalar_summaries(
-            data, feat, prior_dist, post_dist, likes, div,
-            model_loss, value_loss, actor_loss, model_norm, value_norm,
-            actor_norm)
-      if tf.equal(log_images, True):
-        self._image_summaries(data, embed, image_pred)
+    #if tf.distribute.get_replica_context().replica_id_in_sync_group == 0:
+    if self._c.log_scalars:
+      self._scalar_summaries(
+          data, feat, prior_dist, post_dist, likes, div,
+          model_loss, value_loss, actor_loss, model_norm, value_norm,
+          actor_norm)
+    if tf.equal(log_images, True):
+      self._image_summaries(data, embed, image_pred)
+
 
   def _build_model(self):
     acts = dict(
@@ -255,7 +255,7 @@ class Dreamer(tools.Module):
         amount *= 0.5 ** (tf.cast(self._step, tf.float32) / self._c.expl_decay)
       if self._c.expl_min:
         amount = tf.maximum(self._c.expl_min, amount)
-      self._metrics['expl_amount'].update_state(amount)
+      #self._metrics['expl_amount'].update_state(amount)
     elif self._c.eval_noise:
       amount = self._c.eval_noise
     else:
@@ -330,7 +330,6 @@ class Dreamer(tools.Module):
     print(f'[{step}]', ' / '.join(f'{k} {v:.1f}' for k, v in metrics))
     self._writer.flush()
 
-
 def preprocess(obs, config):
   dtype = prec.global_policy().compute_dtype
   obs = obs.copy()
@@ -359,11 +358,13 @@ def load_dataset(directory, config):
   return dataset
 
 
-def summarize_episode(episode, config, datadir, writer, prefix):
-  #print('in summarize_episode: ', episode)
-  print(episode)
+def summarize_episode(config, datadir, writer, prefix):
+  list_of_files = glob.glob(str(datadir)+'/*.npz')
+  latest_file = max(list_of_files, key=os.path.getctime)
+  episode = np.load(latest_file)
+  episode = {k: episode[k] for k in episode.keys()}
   episodes, steps = tools.count_episodes(datadir)
-  print(episodes,steps)
+  print(episodes, steps)
   length = (len(episode['reward']) - 1) * config.action_repeat
   ret = episode['reward'].sum()
   print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
@@ -377,8 +378,8 @@ def summarize_episode(episode, config, datadir, writer, prefix):
   with writer.as_default():  # Env might run in a different thread.
     tf.summary.experimental.set_step(step)
     [tf.summary.scalar('sim/' + k, v) for k, v in metrics]
-    if prefix == 'test':
-      tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
+    #if prefix == 'test':
+    tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
 
 
 def make_env(config, writer, prefix, datadir, store):
@@ -416,62 +417,60 @@ def main(config):
   config.logdir.mkdir(parents=True, exist_ok=True)
   print('Logdir', config.logdir)
 
-  # Create environments.
+  # Setting up Dreamer
   datadir = config.logdir / 'episodes'
+  testdir = config.logdir / 'test_episodes'
   writer = tf.summary.create_file_writer(
       str(config.logdir), max_queue=1000, flush_millis=20000)
   writer.set_as_default()
-  train_envs = [wrappers.Async(lambda: make_env(
-      config, writer, 'train', datadir, store=True), config.parallel)
-      for _ in range(config.envs)]
-  test_envs = [wrappers.Async(lambda: make_env(
-      config, writer, 'test', datadir, store=False), config.parallel)
-      for _ in range(config.envs)]
-  actspace = train_envs[0].action_space
-
-  # Prefill dataset with random episodes.
-  step = count_steps(datadir, config)
-  prefill = max(0, config.prefill - step)
-  print(f'Prefill dataset with {prefill} steps.')
-  random_agent = lambda o, d, _: ([actspace.sample() for _ in d], None)
-  tools.simulate(random_agent, train_envs, prefill / config.action_repeat)
+  actspace = gym.spaces.Box(np.array([-1,-1]),np.array([1,1]))
   writer.flush()
 
-  #path = '/mnt/nvme-storage/antoine/DREAMER/dreamer/logdir/turtle_sim/dreamer/1/episodes/'
-
-
-  # Train and regularly evaluate the agent.
+  
+  steps = count_steps(datadir, config)
+  # Warm Up
+  if steps < 100:
+    c = http.client.HTTPConnection('localhost', 8080)
+    c.request('POST', '/toServer', '{"random": 1, "steps":500, "repeat":9, "discount":1.0, "training": 1}')
+    doc = c.getresponse().read()
   step = count_steps(datadir, config)
-  print(f'Simulating agent for {config.steps-step} steps.')
   agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
-    print('Load checkpoint.')
+    print('Loading checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
-  state = None
-  #import os
-  #training = True
-  #files = os.listdir(str(datadir))
-  #keys = ['image','reward']
-  #for i in range(len(files)):
-  #    print(i)
-  #    episode = np.load(str(datadir)+'/'+files[i])
-  #    episode = {k: episode[k] for k in episode.keys()}
-  #    state=None
-  #    for i in range(500):
-  #        obs = {k: [episode[k][i]] for k in keys}
-  #        action, state = agent(obs, np.array([False]), state, training)
+  keys = ['image','reward']
+  training = True
+  # Train and Evaluate continously
   while step < config.steps:
-    print('Start evaluation.')
-    tools.simulate(
-        functools.partial(agent, training=False), test_envs, episodes=1)
-    writer.flush()
-    print('Start collection.')
-    steps = config.eval_every // config.action_repeat
-    state = tools.simulate(agent, train_envs, steps, state=state)
     step = count_steps(datadir, config)
+    if (step % config.eval_every == 0) and (step != 5000):
+      print('Evaluating')
+      c = http.client.HTTPConnection('localhost', 8080)
+      c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 0}')
+      doc = c.getresponse().read()
+      summarize_episode(config, datadir, agent._writer, 'train')
+      summarize_episode(config, testdir, agent._writer, 'test')
+    # Train
+    print('Training for 100 steps')
+    agent._step.assign(step)
+    step = agent._step.numpy().item()
+    tf.summary.experimental.set_step(step)
+
+    log = agent._should_log(step)
+    for train_step in range(100):
+      log_images = agent._c.log_images and log and train_step == 0
+      agent.train(next(agent._dataset), log_images)
+    if log:
+      agent._write_summaries()
+    # Save model after each training so ROS can load the new one.
     agent.save(config.logdir / 'variables.pkl')
-  for env in train_envs + test_envs:
-    env.close()
+    # Request a new episode from ROS
+    print('Playing')
+    c = http.client.HTTPConnection('localhost', 8080)
+    c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 1}')
+    doc = c.getresponse().read()
+
+    #if step
 
 
 if __name__ == '__main__':
