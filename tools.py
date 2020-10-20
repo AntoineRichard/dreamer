@@ -25,7 +25,7 @@ class Module(tf.Module):
   def save(self, filename):
     values = tf.nest.map_structure(lambda x: x.numpy(), self.variables)
     with pathlib.Path(filename).open('wb') as f:
-      pickle.dump(values, f)
+      pickle.dump(values, f, protocol=2)
 
   def load(self, filename):
     with pathlib.Path(filename).open('rb') as f:
