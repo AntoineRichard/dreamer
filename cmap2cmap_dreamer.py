@@ -103,35 +103,10 @@ class Dreamer(tools.Module):
     self._last_log = None
     self._last_time = time.time()
     self._metrics = collections.defaultdict(tf.metrics.Mean)
-    print('so far so good')
     self._metrics['expl_amount']  # Create variable for checkpoint.
     self._float = prec.global_policy().compute_dtype
-    print('so far so good')
     self._dataset = iter(load_dataset(datadir, self._c))
-    print('so far so good')
     self._build_model()
-    print('so far so good')
-
-  #def __call__(self, obs, reset, state=None, training=True):
-  #  step = self._step.numpy().item()
-  #  tf.summary.experimental.set_step(step)
-  #  if state is not None and reset.any():
-  #    mask = tf.cast(1 - reset, self._float)[:, None]
-  #    state = tf.nest.map_structure(lambda x: x * mask, state)
-  #  if self._should_train(step):
-  #    log = self._should_log(step)
-  #    n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
-  #    print(f'Training for {n} steps.')
-  #    #with self._strategy.scope():
-  #      #for train_step in range(n):
-  #        #log_images = self._c.log_images and log and train_step == 0
-  #        #self.train(next(self._dataset), log_images)
-  #    if log:
-  #      #self._write_summaries()
-  #  action, state = self.policy(obs, state, training)
-  #  if training:
-  #    self._step.assign_add(len(reset) * self._c.action_repeat)
-  #  return action, state
 
   @tf.function
   def policy(self, obs, state, training):
@@ -157,7 +132,6 @@ class Dreamer(tools.Module):
 
   @tf.function()
   def train(self, data, log_images=False):
-    #self._strategy.experimental_run_v2(self._train, args=(data, log_images))
     self._train(data, log_images)
 
   def _train(self, data, log_images):
@@ -171,8 +145,6 @@ class Dreamer(tools.Module):
       likes = tools.AttrDict()
       likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
       likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
-      likes.physics = tf.reduce_mean(physics_pred.log_prob(data['physics']))
-      phys_error = tf.sqrt(tf.reduce_mean(tf.square(tf.subtract(physics_pred.mode(), data['physics'])),axis=(0,1)))
       if self._c.pcont:
         pcont_pred = self._pcont(feat)
         pcont_target = self._c.discount * data['discount']
@@ -216,7 +188,7 @@ class Dreamer(tools.Module):
       self._scalar_summaries(
           data, feat, prior_dist, post_dist, likes, div,
           model_loss, value_loss, actor_loss, model_norm, value_norm,
-          actor_norm, phys_error)
+          actor_norm)
     if tf.equal(log_images, True):
       self._image_summaries(data, embed, image_pred)
 
@@ -232,7 +204,6 @@ class Dreamer(tools.Module):
         self._c.stoch_size, self._c.deter_size, self._c.deter_size)
     self._decode = models.ConvDecoder(self._c.cnn_depth, cnn_act)
     self._reward = models.DenseDecoder((), 2, self._c.num_units, act=act)
-    self._physics = models.DenseDecoder([3], 2, self._c.num_units, act=act)
     if self._c.pcont:
       self._pcont = models.DenseDecoder(
           (), 3, self._c.num_units, 'binary', act=act)
@@ -294,7 +265,7 @@ class Dreamer(tools.Module):
   def _scalar_summaries(
       self, data, feat, prior_dist, post_dist, likes, div,
       model_loss, value_loss, actor_loss, model_norm, value_norm,
-      actor_norm, phys_error):
+      actor_norm):
     self._metrics['model_grad_norm'].update_state(model_norm)
     self._metrics['value_grad_norm'].update_state(value_norm)
     self._metrics['actor_grad_norm'].update_state(actor_norm)
@@ -307,10 +278,6 @@ class Dreamer(tools.Module):
     self._metrics['value_loss'].update_state(value_loss)
     self._metrics['actor_loss'].update_state(actor_loss)
     self._metrics['action_ent'].update_state(self._actor(feat).entropy())
-    for i in range(3):
-        self._metrics['linear_vel_err'].update_state(phys_error[0])
-        self._metrics['lateral_vel_err'].update_state(phys_error[1])
-        self._metrics['angular_vel_err'].update_state(phys_error[2])
 
   def _image_summaries(self, data, embed, image_pred):
     truth = data['image'][:6] + 0.5
