@@ -6,6 +6,18 @@ from tensorflow.keras.mixed_precision import experimental as prec
 
 import tools
 
+def Conv1DTranspose(input_tensor, filters, kernel_size, strides=2, padding='same', activation='relu'):
+    """
+        input_tensor: tensor, with the shape (batch_size, time_steps, dims)
+        filters: int, output dimension, i.e. the output tensor will have the shape of (batch_size, time_steps, filters)
+        kernel_size: int, size of the convolution kernel
+        strides: int, convolution step size
+        padding: 'same' | 'valid'
+    """
+    x = tfkl.Lambda(lambda x: tf.expand_dims(x, axis=2))(input_tensor)
+    x = tfkl.Conv2DTranspose(filters=filters, kernel_size=(kernel_size, 1), strides=(strides, 1), padding=padding, activation=activation)(x)
+    x = tfkl.Lambda(lambda x: tf.squeeze(x, axis=2))(x)
+    return x
 
 class RSSM(tools.Module):
 
@@ -80,7 +92,6 @@ class RSSM(tools.Module):
     prior = {'mean': mean, 'std': std, 'stoch': stoch, 'deter': deter}
     return prior
 
-
 class ConvEncoder(tools.Module):
 
   def __init__(self, depth=32, act=tf.nn.relu):
@@ -95,6 +106,23 @@ class ConvEncoder(tools.Module):
     x = self.get('h3', tfkl.Conv2D, 4 * self._depth, 4, **kwargs)(x)
     x = self.get('h4', tfkl.Conv2D, 8 * self._depth, 4, **kwargs)(x)
     shape = tf.concat([tf.shape(obs['image'])[:-3], [32 * self._depth]], 0)
+    return tf.reshape(x, shape)
+
+class LaserConvEncoder(tools.Module):
+
+  def __init__(self, depth=32, act=tf.nn.relu):
+    self._act = act
+    self._depth = depth
+
+  def __call__(self, obs):
+    kwargs = dict(strides=2, activation=self._act)
+    x = tf.reshape(obs['laser'], (-1,) + tuple(obs['laser'].shape[-2:]))
+    x = self.get('h1', tfkl.Conv1D, 1 * self._depth, 6, **kwargs)(x)
+    x = self.get('h2', tfkl.Conv1D, 2 * self._depth, 6, **kwargs)(x)
+    x = self.get('h3', tfkl.Conv1D, 3 * self._depth, 6, **kwargs)(x)
+    x = self.get('h4', tfkl.Conv1D, 4 * self._depth, 6, **kwargs)(x)
+    x = self.get('h5', tfkl.Conv1D, 8 * self._depth, 6, **kwargs)(x)
+    shape = tf.concat([tf.shape(obs['laser'])[:-2], [32*self._depth]], 0)
     return tf.reshape(x, shape)
 
 
@@ -113,9 +141,29 @@ class ConvDecoder(tools.Module):
     x = self.get('h3', tfkl.Conv2DTranspose, 2 * self._depth, 5, **kwargs)(x)
     x = self.get('h4', tfkl.Conv2DTranspose, 1 * self._depth, 6, **kwargs)(x)
     x = self.get('h5', tfkl.Conv2DTranspose, self._shape[-1], 6, strides=2)(x)
+
     mean = tf.reshape(x, tf.concat([tf.shape(features)[:-1], self._shape], 0))
     return tfd.Independent(tfd.Normal(mean, 1), len(self._shape))
 
+class LaserConvDecoder(tools.Module):
+
+  def __init__(self, depth=32, act=tf.nn.relu, shape=(256, 1)):
+    self._act = act
+    self._depth = depth
+    self._shape = shape
+
+  def __call__(self, features):
+    kwargs = dict(strides=(2,1), activation=self._act, padding='same')
+    kwargs2 = dict(strides=(4,1), activation=self._act, padding='same')
+    x = self.get('h1', tfkl.Dense, 32 * self._depth, None)(features)
+    x = tf.reshape(x, [-1, 1, 1, 32 * self._depth])
+    x = self.get('h2', tfkl.Conv2DTranspose, 8 * self._depth, (5,1), **kwargs2)(x)
+    x = self.get('h3', tfkl.Conv2DTranspose, 4 * self._depth, (5,1), **kwargs2)(x)
+    x = self.get('h4', tfkl.Conv2DTranspose, 2 * self._depth, (5,1), **kwargs2)(x)
+    x = self.get('h5', tfkl.Conv2DTranspose, 1 * self._depth, (5,1), **kwargs)(x)
+    x = self.get('h6', tfkl.Conv2DTranspose, self._shape[-1], (5,1), strides=(2,1), padding='same')(x)
+    mean = tf.reshape(x, tf.concat([tf.shape(features)[:-1], self._shape], 0))
+    return tfd.Independent(tfd.Normal(mean, 1), len(self._shape))
 
 class DenseDecoder(tools.Module):
 
@@ -138,6 +186,46 @@ class DenseDecoder(tools.Module):
       return tfd.Independent(tfd.Bernoulli(x), len(self._shape))
     raise NotImplementedError(self._dist)
 
+class DenseDecoderDet(tools.Module):
+
+  def __init__(self, shape, layers, units, dist='normal', act=tf.nn.elu):
+    self._shape = shape
+    self._layers = layers
+    self._units = units
+    self._dist = dist
+    self._act = act
+
+  def __call__(self, features):
+    x = features
+    for index in range(self._layers):
+      x = self.get(f'h{index}', tfkl.Dense, self._units, self._act)(x)
+    x = self.get(f'hout', tfkl.Dense, np.prod(self._shape))(x)
+    x = tf.reshape(x, tf.concat([tf.shape(features)[:-1], self._shape], 0))
+    return x
+
+class PhysicalModel(tools.Module):
+
+  def __init__(self, shape, layers, units, dist='normal', act=tf.nn.elu):
+    self._shape = shape
+    self._layers = layers
+    self._units = units
+    self._dist = dist
+    self._act = act
+
+  def __call__(self, phy, actions):
+    x = phy
+    u = actions
+
+    nl = self.get('nl1', tfkl.Dense, self._units, self._act)(tf.concatenate((x,u),axis=-1))
+    nl = self.get('nl2', tfkl.Dense, self._units, self._act)(nl)
+    nl = self.get('nl3', tfkl.Dense, self._shape)(nl)
+
+    a = self.get('a', tfkl.Dense, self._shape, use_bias=False)(x)
+    b = self.get('b', tfkl.Dense, self._shape, use_bias=False)(u)
+
+    dyn_lin = a + b
+    dyn = a + b + nl
+    return dyn_lin, nl, dyn
 
 class ActionDecoder(tools.Module):
 

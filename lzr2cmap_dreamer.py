@@ -3,13 +3,17 @@ import collections
 import functools
 import json
 import os
+import glob
 import pathlib
 import sys
 import time
+import http.client
+from bottle import Bottle, request
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['MUJOCO_GL'] = 'egl'
 
+import gym
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.mixed_precision import experimental as prec
@@ -30,17 +34,17 @@ def define_config():
   config.logdir = pathlib.Path('.')
   config.seed = 0
   config.steps = 5e6
-  config.eval_every = 1e4
+  config.eval_every = 5000
   config.log_every = 1e3
   config.log_scalars = True
   config.log_images = True
   config.gpu_growth = True
-  config.precision = 16
+  config.precision = 32
   # Environment.
   config.task = 'dmc_walker_walk'
   config.envs = 1
   config.parallel = 'none'
-  config.action_repeat = 2
+  config.action_repeat = 1
   config.time_limit = 1000
   config.prefill = 5000
   config.eval_noise = 0.0
@@ -51,7 +55,7 @@ def define_config():
   config.num_units = 400
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
-  config.cnn_depth = 32
+  config.cnn_depth = 16
   config.pcont = False
   config.free_nats = 3.0
   config.kl_scale = 1.0
@@ -70,7 +74,7 @@ def define_config():
   config.grad_clip = 100.0
   config.dataset_balance = False
   # Behavior.
-  config.discount = 0.99
+  config.discount = 0.997
   config.disclam = 0.95
   config.horizon = 15
   config.action_dist = 'tanh_normal'
@@ -100,38 +104,14 @@ class Dreamer(tools.Module):
     self._metrics = collections.defaultdict(tf.metrics.Mean)
     self._metrics['expl_amount']  # Create variable for checkpoint.
     self._float = prec.global_policy().compute_dtype
-    self._strategy = tf.distribute.MirroredStrategy()
-    with self._strategy.scope():
-      self._dataset = iter(self._strategy.experimental_distribute_dataset(
-          load_dataset(datadir, self._c)))
-      self._build_model()
-
-  def __call__(self, obs, reset, state=None, training=True):
-    step = self._step.numpy().item()
-    tf.summary.experimental.set_step(step)
-    if state is not None and reset.any():
-      mask = tf.cast(1 - reset, self._float)[:, None]
-      state = tf.nest.map_structure(lambda x: x * mask, state)
-    if self._should_train(step):
-      log = self._should_log(step)
-      n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
-      print(f'Training for {n} steps.')
-      with self._strategy.scope():
-        for train_step in range(n):
-          log_images = self._c.log_images and log and train_step == 0
-          self.train(next(self._dataset), log_images)
-      if log:
-        self._write_summaries()
-    action, state = self.policy(obs, state, training)
-    if training:
-      self._step.assign_add(len(reset) * self._c.action_repeat)
-    return action, state
+    self._dataset = iter(load_dataset(datadir, self._c))
+    self._build_model()
 
   @tf.function
   def policy(self, obs, state, training):
     if state is None:
-      latent = self._dynamics.initial(len(obs['image']))
-      action = tf.zeros((len(obs['image']), self._actdim), self._float)
+      latent = self._dynamics.initial(len(obs['laser']))
+      action = tf.zeros((len(obs['laser']), self._actdim), self._float)
     else:
       latent, action = state
     embed = self._encode(preprocess(obs, self._c))
@@ -151,7 +131,7 @@ class Dreamer(tools.Module):
 
   @tf.function()
   def train(self, data, log_images=False):
-    self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+    self._train(data, log_images)
 
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
@@ -173,7 +153,6 @@ class Dreamer(tools.Module):
       div = tf.reduce_mean(tfd.kl_divergence(post_dist, prior_dist))
       div = tf.maximum(div, self._c.free_nats)
       model_loss = self._c.kl_scale * div - sum(likes.values())
-      model_loss /= float(self._strategy.num_replicas_in_sync)
 
     with tf.GradientTape() as actor_tape:
       imag_feat = self._imagine_ahead(post)
@@ -189,26 +168,24 @@ class Dreamer(tools.Module):
       discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
           [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
       actor_loss = -tf.reduce_mean(discount * returns)
-      actor_loss /= float(self._strategy.num_replicas_in_sync)
 
     with tf.GradientTape() as value_tape:
       value_pred = self._value(imag_feat)[:-1]
       target = tf.stop_gradient(returns)
       value_loss = -tf.reduce_mean(discount * value_pred.log_prob(target))
-      value_loss /= float(self._strategy.num_replicas_in_sync)
 
     model_norm = self._model_opt(model_tape, model_loss)
     actor_norm = self._actor_opt(actor_tape, actor_loss)
     value_norm = self._value_opt(value_tape, value_loss)
 
-    if tf.distribute.get_replica_context().replica_id_in_sync_group == 0:
-      if self._c.log_scalars:
-        self._scalar_summaries(
-            data, feat, prior_dist, post_dist, likes, div,
-            model_loss, value_loss, actor_loss, model_norm, value_norm,
-            actor_norm)
-      if tf.equal(log_images, True):
-        self._image_summaries(data, embed, image_pred)
+    if self._c.log_scalars:
+      self._scalar_summaries(
+          data, feat, prior_dist, post_dist, likes, div,
+          model_loss, value_loss, actor_loss, model_norm, value_norm,
+          actor_norm)
+    if tf.equal(log_images, True):
+      self._image_summaries(data, embed, image_pred)
+
 
   def _build_model(self):
     acts = dict(
@@ -216,7 +193,7 @@ class Dreamer(tools.Module):
         leaky_relu=tf.nn.leaky_relu)
     cnn_act = acts[self._c.cnn_act]
     act = acts[self._c.dense_act]
-    self._encode = models.ConvEncoder(self._c.cnn_depth, cnn_act)
+    self._encode = models.LaserConvEncoder(self._c.cnn_depth, cnn_act)
     self._dynamics = models.RSSM(
         self._c.stoch_size, self._c.deter_size, self._c.deter_size)
     self._decode = models.ConvDecoder(self._c.cnn_depth, cnn_act)
@@ -249,7 +226,6 @@ class Dreamer(tools.Module):
         amount *= 0.5 ** (tf.cast(self._step, tf.float32) / self._c.expl_decay)
       if self._c.expl_min:
         amount = tf.maximum(self._c.expl_min, amount)
-      self._metrics['expl_amount'].update_state(amount)
     elif self._c.eval_noise:
       amount = self._c.eval_noise
     else:
@@ -328,6 +304,9 @@ def preprocess(obs, config):
   dtype = prec.global_policy().compute_dtype
   obs = obs.copy()
   with tf.device('cpu:0'):
+    print(obs['laser'])
+    obs['laser'] = tf.cast(1/obs['laser'] - 0.5, dtype)
+    print(obs['laser'].shape)
     obs['image'] = tf.cast(obs['image'], dtype) / 255.0 - 0.5
     clip_rewards = dict(none=lambda x: x, tanh=tf.tanh)[config.clip_rewards]
     obs['reward'] = clip_rewards(obs['reward'])
@@ -352,8 +331,13 @@ def load_dataset(directory, config):
   return dataset
 
 
-def summarize_episode(episode, config, datadir, writer, prefix):
+def summarize_episode(config, datadir, writer, prefix):
+  list_of_files = glob.glob(str(datadir)+'/*.npz')
+  latest_file = max(list_of_files, key=os.path.getctime)
+  episode = np.load(latest_file)
+  episode = {k: episode[k] for k in episode.keys()}
   episodes, steps = tools.count_episodes(datadir)
+  print(episodes, steps)
   length = (len(episode['reward']) - 1) * config.action_repeat
   ret = episode['reward'].sum()
   print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
@@ -367,8 +351,8 @@ def summarize_episode(episode, config, datadir, writer, prefix):
   with writer.as_default():  # Env might run in a different thread.
     tf.summary.experimental.set_step(step)
     [tf.summary.scalar('sim/' + k, v) for k, v in metrics]
-    if prefix == 'test':
-      tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
+    #if prefix == 'test':
+    tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
 
 
 def make_env(config, writer, prefix, datadir, store):
@@ -406,157 +390,63 @@ def main(config):
   config.logdir.mkdir(parents=True, exist_ok=True)
   print('Logdir', config.logdir)
 
-  # Create environments.
+  # Setting up Dreamer
   datadir = config.logdir / 'episodes'
+  testdir = config.logdir / 'test_episodes'
   writer = tf.summary.create_file_writer(
       str(config.logdir), max_queue=1000, flush_millis=20000)
   writer.set_as_default()
-  train_envs = [wrappers.Async(lambda: make_env(
-      config, writer, 'train', datadir, store=True), config.parallel)
-      for _ in range(config.envs)]
-  #test_envs = [wrappers.Async(lambda: make_env(
-  #    config, writer, 'test', datadir, store=False), config.parallel)
-  #    for _ in range(config.envs)]
-  actspace = train_envs[0].action_space
-  #print(actspace)
-  #exit(0)
-  # Prefill dataset with random episodes.
-  step = count_steps(datadir, config)
-  #prefill = max(0, config.prefill - step)
-  #print(f'Prefill dataset with {prefill} steps.')
-  #random_agent = lambda o, d, _: ([actspace.sample() for _ in d], None)
-  #tools.simulate(random_agent, train_envs, prefill / config.action_repeat)
+  actspace = gym.spaces.Box(np.array([-1,-1]),np.array([1,1]))
   writer.flush()
 
-  # Train and regularly evaluate the agent.
-  #step = count_steps(datadir, config)
-  #print(f'Simulating agent for {config.steps-step} steps.')
+  has_trained = False
+  
+  steps = count_steps(datadir, config)
+  # Warm Up
+  if steps < 100:
+    c = http.client.HTTPConnection('localhost', 8080)
+    c.request('POST', '/toServer', '{"random": 1, "steps":500, "repeat":4, "discount":1.0, "training": 1}')
+
+  step = count_steps(datadir, config)
   agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
-    print('Load checkpoint.')
+    print('Loading checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
-  print('Trying manual steps')
-  training=False
-  episode = np.load('/mnt/nvme-storage/antoine/DREAMER/dreamer/logdir/dmc_walker_walk/dreamer/1/episodes/20200505T170850-fdfb6c050e364a40a22d5255a5519e70-501.npz')
-  episode = {k: episode[k] for k in episode.keys()}
-  state=None
-  keys = ['orientations','height','velocity','image','reward']
-  obs = {k: [episode[k][0]] for k in keys}
-  # Alternate between train env steps and test env steps
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  reset = [False]
-  #if state is not None and reset.any():
-  #      mask = tf.cast(1 - reset, self._float)[:, None]
-  #      state = tf.nest.map_structure(lambda x: x * mask, state)
-  obs = {k: [episode[k][1]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][2]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][3]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][4]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][5]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][6]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][7]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][8]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][9]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][10]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][11]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][12]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][13]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  obs = {k: [episode[k][14]] for k in keys}
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  print('Benching')
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  print('Force Reload')
-  if (config.logdir / 'variables.pkl').exists():
-    print('Load checkpoint.')
-    agent.load(config.logdir / 'variables.pkl')
-  print('Benching')
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  print('Force Reload')
-  if (config.logdir / 'variables.pkl').exists():
-    print('Load checkpoint.')
-    agent.load(config.logdir / 'variables.pkl')
-  print('Benching')
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  action, state = agent.policy(obs, state, training)
-  print('Manual step OK')
-  # When performing training steps increment agent._step
-  #if training:
-  #  agent._step.assign_add(len(reset) * agent._c.action_repeat)
 
+  # Train and Evaluate continously
+  while step < config.steps:
+    step = count_steps(datadir, config)
+    if (step % config.eval_every == 0) and (has_trained):
+      print('Evaluating')
+      c = http.client.HTTPConnection('localhost', 8080)
+      c.request('POST', '/toServer', '{"random": 0, "steps":1000, "repeat":0, "discount":1.0, "training": 0}')
+      
+      summarize_episode(config, datadir, agent._writer, 'train')
+      summarize_episode(config, testdir, agent._writer, 'test')
+    # Train
+    print('Training for 100 steps')
+    agent._step.assign(step)
+    step = agent._step.numpy().item()
+    tf.summary.experimental.set_step(step)
 
-  # when done with steps of agent
-  #tools.save_episodes(datadir, [ep])
-  #summarize_episode(ep, config, datadir, writer, prefix)
+    log = agent._should_log(step)
+    for train_step in range(100):
+      log_images = agent._c.log_images and log and (train_step == 0)
+      agent.train(next(agent._dataset), log_images)
+    if log:
+      agent._write_summaries()
+    has_trained=True
+    # Save model after each training so ROS can load the new one.
+    agent.save(config.logdir / 'variables.pkl')
+    agent._encode.save(os.path.join(config.logdir,'encoder_weights.pkl'))
+    agent._decode.save(os.path.join(config.logdir,'decoder_weights.pkl'))
+    agent._dynamics.save(os.path.join(config.logdir,'dynamics_weights.pkl'))
+    agent._actor.save(os.path.join(config.logdir,'actor_weights.pkl'))
 
-
-
-
-  #while step < config.steps:
-  #  print('Start evaluation.')
-  #  tools.simulate(
-  #      functools.partial(agent, training=False), test_envs, episodes=1)
-  #  writer.flush()
-  #  print('Start collection.')
-  #  steps = config.eval_every // config.action_repeat
-  #  state = tools.simulate(agent, train_envs, steps, state=state)
-  #  step = count_steps(datadir, config)
-  #  agent.save(config.logdir / 'variables.pkl')
-  for env in train_envs:# + test_envs:
-    env.close()
-
+    # Request a new episode from ROS
+    print('Playing')
+    c = http.client.HTTPConnection('localhost', 8080)
+    c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 1}')
 
 if __name__ == '__main__':
   try:

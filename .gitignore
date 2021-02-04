@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 *.egg-info
-./dist
-./logdir
+dist
+logdir
+dreamer_tools
+DREAMER_MODELS
+tmp
 MUJOCO_LOG.TXT

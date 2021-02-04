@@ -160,10 +160,7 @@ class Collect:
 
   def step(self, action):
     obs, reward, done, info = self._env.step(action)
-    #print(obs,done)
     obs = {k: self._convert(v) for k, v in obs.items()}
-    #print(obs, info)
-    #print(info)
     transition = obs.copy()
     transition['action'] = action
     transition['reward'] = reward
@@ -179,7 +176,6 @@ class Collect:
 
   def reset(self):
     obs = self._env.reset()
-    #print(obs)
     transition = obs.copy()
     transition['action'] = np.zeros(self._env.action_space.shape)
     transition['reward'] = 0.0

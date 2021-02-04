@@ -39,7 +39,7 @@ def define_config():
   config.log_scalars = True
   config.log_images = True
   config.gpu_growth = True
-  config.precision = 16
+  config.precision = 32
   # Environment.
   config.task = 'dmc_walker_walk'
   config.envs = 1
@@ -62,6 +62,7 @@ def define_config():
   config.pcont_scale = 10.0
   config.weight_decay = 0.0
   config.weight_decay_pattern = r'.*'
+  config.physics_dim = 2
   # Training.
   config.batch_size = 50
   config.batch_length = 50
@@ -74,7 +75,7 @@ def define_config():
   config.grad_clip = 100.0
   config.dataset_balance = False
   # Behavior.
-  config.discount = 0.99
+  config.discount = 0.9965
   config.disclam = 0.95
   config.horizon = 15
   config.action_dist = 'tanh_normal'
@@ -102,13 +103,14 @@ class Dreamer(tools.Module):
     self._last_log = None
     self._last_time = time.time()
     self._metrics = collections.defaultdict(tf.metrics.Mean)
+    print('so far so good')
     self._metrics['expl_amount']  # Create variable for checkpoint.
     self._float = prec.global_policy().compute_dtype
-    #self._strategy = tf.distribute.MirroredStrategy()
-    #with self._strategy.scope():
-    #  self._dataset = iter#(self._strategy.experimental_distribute_dataset(
+    print('so far so good')
     self._dataset = iter(load_dataset(datadir, self._c))
+    print('so far so good')
     self._build_model()
+    print('so far so good')
 
   #def __call__(self, obs, reset, state=None, training=True):
   #  step = self._step.numpy().item()
@@ -165,9 +167,12 @@ class Dreamer(tools.Module):
       feat = self._dynamics.get_feat(post)
       image_pred = self._decode(feat)
       reward_pred = self._reward(feat)
+      physics_pred = self._physics(feat)
       likes = tools.AttrDict()
       likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
       likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
+      likes.physics = tf.reduce_mean(physics_pred.log_prob(data['physics']))
+      phys_error = tf.sqrt(tf.reduce_mean(tf.square(tf.subtract(physics_pred.mode(), data['physics'])),axis=(0,1)))
       if self._c.pcont:
         pcont_pred = self._pcont(feat)
         pcont_target = self._c.discount * data['discount']
@@ -211,7 +216,7 @@ class Dreamer(tools.Module):
       self._scalar_summaries(
           data, feat, prior_dist, post_dist, likes, div,
           model_loss, value_loss, actor_loss, model_norm, value_norm,
-          actor_norm)
+          actor_norm, phys_error)
     if tf.equal(log_images, True):
       self._image_summaries(data, embed, image_pred)
 
@@ -227,6 +232,7 @@ class Dreamer(tools.Module):
         self._c.stoch_size, self._c.deter_size, self._c.deter_size)
     self._decode = models.ConvDecoder(self._c.cnn_depth, cnn_act)
     self._reward = models.DenseDecoder((), 2, self._c.num_units, act=act)
+    self._physics = models.DenseDecoder([3], 2, self._c.num_units, act=act)
     if self._c.pcont:
       self._pcont = models.DenseDecoder(
           (), 3, self._c.num_units, 'binary', act=act)
@@ -288,7 +294,7 @@ class Dreamer(tools.Module):
   def _scalar_summaries(
       self, data, feat, prior_dist, post_dist, likes, div,
       model_loss, value_loss, actor_loss, model_norm, value_norm,
-      actor_norm):
+      actor_norm, phys_error):
     self._metrics['model_grad_norm'].update_state(model_norm)
     self._metrics['value_grad_norm'].update_state(value_norm)
     self._metrics['actor_grad_norm'].update_state(actor_norm)
@@ -301,6 +307,10 @@ class Dreamer(tools.Module):
     self._metrics['value_loss'].update_state(value_loss)
     self._metrics['actor_loss'].update_state(actor_loss)
     self._metrics['action_ent'].update_state(self._actor(feat).entropy())
+    for i in range(3):
+        self._metrics['linear_vel_err'].update_state(phys_error[0])
+        self._metrics['lateral_vel_err'].update_state(phys_error[1])
+        self._metrics['angular_vel_err'].update_state(phys_error[2])
 
   def _image_summaries(self, data, embed, image_pred):
     truth = data['image'][:6] + 0.5
@@ -381,6 +391,13 @@ def summarize_episode(config, datadir, writer, prefix):
     #if prefix == 'test':
     tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
 
+def episode_reward(config, datadir):
+  list_of_files = glob.glob(str(datadir)+'/*.npz')
+  latest_file = max(list_of_files, key=os.path.getctime)
+  episode = np.load(latest_file)
+  episode = {k: episode[k] for k in episode.keys()}
+  ret = episode['reward'][-250:].sum()
+  return ret
 
 def make_env(config, writer, prefix, datadir, store):
   suite, task = config.task.split('_', 1)
@@ -426,12 +443,15 @@ def main(config):
   actspace = gym.spaces.Box(np.array([-1,-1]),np.array([1,1]))
   writer.flush()
 
+  has_trained = False
   
   steps = count_steps(datadir, config)
+  last_reward = -10000
+  print('Going for warmup')
   # Warm Up
   if steps < 100:
     c = http.client.HTTPConnection('localhost', 8080)
-    c.request('POST', '/toServer', '{"random": 1, "steps":500, "repeat":9, "discount":1.0, "training": 1}')
+    c.request('POST', '/toServer', '{"random": 1, "steps":500, "repeat":4, "discount":1.0, "training": 1, "current_step":0, "reward":-10000}')
     doc = c.getresponse().read()
   step = count_steps(datadir, config)
   agent = Dreamer(config, datadir, actspace, writer)
@@ -440,13 +460,15 @@ def main(config):
     agent.load(config.logdir / 'variables.pkl')
   keys = ['image','reward']
   training = True
+
   # Train and Evaluate continously
   while step < config.steps:
     step = count_steps(datadir, config)
-    if (step % config.eval_every == 0) and (step != 5000):
+    last_reward = episode_reward(config, datadir)
+    if (step % config.eval_every == 0) and (has_trained):
       print('Evaluating')
       c = http.client.HTTPConnection('localhost', 8080)
-      c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 0}')
+      c.request('POST', '/toServer', '{"random": 0, "steps":1000, "repeat":0, "discount":1.0, "training": 0, "current_step":'+str(step)+', "reward":'+str(last_reward)+'}')
       doc = c.getresponse().read()
       summarize_episode(config, datadir, agent._writer, 'train')
       summarize_episode(config, testdir, agent._writer, 'test')
@@ -462,12 +484,18 @@ def main(config):
       agent.train(next(agent._dataset), log_images)
     if log:
       agent._write_summaries()
+    has_trained=True
     # Save model after each training so ROS can load the new one.
     agent.save(config.logdir / 'variables.pkl')
+    agent._encode.save(os.path.join(config.logdir,'encoder_weights.pkl'))
+    agent._decode.save(os.path.join(config.logdir,'decoder_weights.pkl'))
+    agent._dynamics.save(os.path.join(config.logdir,'dynamics_weights.pkl'))
+    agent._actor.save(os.path.join(config.logdir,'actor_weights.pkl'))
+
     # Request a new episode from ROS
     print('Playing')
     c = http.client.HTTPConnection('localhost', 8080)
-    c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 1}')
+    c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":0.9965, "training": 1, "current_step":'+str(step)+', "reward":'+str(last_reward)+'}')
     doc = c.getresponse().read()
 
     #if step

@@ -128,8 +128,6 @@ def simulate(agent, envs, steps=0, episodes=0, state=None):
     length += 1
     step += (done * length).sum()
     length *= (1 - done)
-  print(episodes)
-  print(episode)
   # Return new state to allow resuming the simulation.
   return (step - steps, episode - episodes, done, length, obs, agent_state)
 
