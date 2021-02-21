@@ -14,7 +14,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.mixed_precision import experimental as prec
 
-tf.get_logger().setLevel('DEBUG')
+tf.get_logger().setLevel('ERROR')
 
 from tensorflow_probability import distributions as tfd
 
@@ -109,15 +109,10 @@ class Dreamer(tools.Module):
 
   def __call__(self, obs, reset, state=None, training=True):
     step = self._step.numpy().item()
-    #print('step: ',step, 'reset', reset, 'training: ', training)
     tf.summary.experimental.set_step(step)
-    #print(state)
     if state is not None and reset.any():
       mask = tf.cast(1 - reset, self._float)[:, None]
       state = tf.nest.map_structure(lambda x: x * mask, state)
-    #print(state)
-    #print(obs)
-    #print(reset)
     if self._should_train(step):
       log = self._should_log(step)
       n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
@@ -360,10 +355,7 @@ def load_dataset(directory, config):
 
 
 def summarize_episode(episode, config, datadir, writer, prefix):
-  #print('in summarize_episode: ', episode)
-  print(episode)
   episodes, steps = tools.count_episodes(datadir)
-  print(episodes,steps)
   length = (len(episode['reward']) - 1) * config.action_repeat
   ret = episode['reward'].sum()
   print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
@@ -437,9 +429,6 @@ def main(config):
   tools.simulate(random_agent, train_envs, prefill / config.action_repeat)
   writer.flush()
 
-  #path = '/mnt/nvme-storage/antoine/DREAMER/dreamer/logdir/turtle_sim/dreamer/1/episodes/'
-
-
   # Train and regularly evaluate the agent.
   step = count_steps(datadir, config)
   print(f'Simulating agent for {config.steps-step} steps.')
@@ -448,18 +437,6 @@ def main(config):
     print('Load checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
   state = None
-  #import os
-  #training = True
-  #files = os.listdir(str(datadir))
-  #keys = ['image','reward']
-  #for i in range(len(files)):
-  #    print(i)
-  #    episode = np.load(str(datadir)+'/'+files[i])
-  #    episode = {k: episode[k] for k in episode.keys()}
-  #    state=None
-  #    for i in range(500):
-  #        obs = {k: [episode[k][i]] for k in keys}
-  #        action, state = agent(obs, np.array([False]), state, training)
   while step < config.steps:
     print('Start evaluation.')
     tools.simulate(

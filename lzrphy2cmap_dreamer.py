@@ -55,7 +55,7 @@ def define_config():
   config.num_units = 400
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
-  config.cnn_depth = 16
+  config.cnn_depth = 32
   config.pcont = False
   config.free_nats = 3.0
   config.kl_scale = 1.0
@@ -104,6 +104,7 @@ class Dreamer(tools.Module):
     self._metrics = collections.defaultdict(tf.metrics.Mean)
     self._metrics['expl_amount']  # Create variable for checkpoint.
     self._float = prec.global_policy().compute_dtype
+ 
     self._dataset = iter(load_dataset(datadir, self._c))
     self._build_model()
 
@@ -140,9 +141,15 @@ class Dreamer(tools.Module):
       feat = self._dynamics.get_feat(post)
       image_pred = self._decode(feat)
       reward_pred = self._reward(feat)
+      # NEW
+      physics_pred = self._physics(feat)
+      # ---
       likes = tools.AttrDict()
       likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
       likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
+      # NEW
+      likes.physics = tf.reduce_mean(physics_pred.log_prob(data['physics']))
+      # ---
       if self._c.pcont:
         pcont_pred = self._pcont(feat)
         pcont_target = self._c.discount * data['discount']
@@ -193,11 +200,14 @@ class Dreamer(tools.Module):
         leaky_relu=tf.nn.leaky_relu)
     cnn_act = acts[self._c.cnn_act]
     act = acts[self._c.dense_act]
-    self._encode = models.LaserConvEncoder(self._c.cnn_depth, cnn_act)
+    self._encode = models.LaserConvEncoderWithBypass(self._c.cnn_depth, cnn_act)
     self._dynamics = models.RSSM(
         self._c.stoch_size, self._c.deter_size, self._c.deter_size)
     self._decode = models.ConvDecoder(self._c.cnn_depth, cnn_act)
     self._reward = models.DenseDecoder((), 2, self._c.num_units, act=act)
+    # NEW
+    self._physics = models.DenseDecoder((), 2, self._c.num_units, act=act)
+    # ---
     if self._c.pcont:
       self._pcont = models.DenseDecoder(
           (), 3, self._c.num_units, 'binary', act=act)
@@ -226,6 +236,7 @@ class Dreamer(tools.Module):
         amount *= 0.5 ** (tf.cast(self._step, tf.float32) / self._c.expl_decay)
       if self._c.expl_min:
         amount = tf.maximum(self._c.expl_min, amount)
+      #self._metrics['expl_amount'].update_state(amount)
     elif self._c.eval_noise:
       amount = self._c.eval_noise
     else:
@@ -305,7 +316,10 @@ def preprocess(obs, config):
   obs = obs.copy()
   with tf.device('cpu:0'):
     print(obs['laser'])
+    print(obs['vel_as_laser'])
+    #obs['laser'] = tf.concat([tf.cast(1/obs['laser'] - 0.5, dtype), tf.cast(obs['vel_as_laser'], dtype)], axis=-1)
     obs['laser'] = tf.cast(1/obs['laser'] - 0.5, dtype)
+    obs['vel_as_laser'] = tf.squeeze(tf.cast(obs['vel_as_laser'], dtype))
     print(obs['laser'].shape)
     obs['image'] = tf.cast(obs['image'], dtype) / 255.0 - 0.5
     clip_rewards = dict(none=lambda x: x, tanh=tf.tanh)[config.clip_rewards]
@@ -412,6 +426,8 @@ def main(config):
   if (config.logdir / 'variables.pkl').exists():
     print('Loading checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
+  keys = ['image','reward']
+  training = True
 
   # Train and Evaluate continously
   while step < config.steps:
@@ -421,7 +437,6 @@ def main(config):
       c = http.client.HTTPConnection('localhost', 8080)
       c.request('POST', '/toServer', '{"random": 0, "steps":1000, "repeat":0, "discount":1.0, "training": 0}')
       doc = c.getresponse().read()
-
       summarize_episode(config, datadir, agent._writer, 'train')
       summarize_episode(config, testdir, agent._writer, 'test')
     # Train
@@ -449,7 +464,6 @@ def main(config):
     c = http.client.HTTPConnection('localhost', 8080)
     c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 1}')
     doc = c.getresponse().read()
-
 
 if __name__ == '__main__':
   try:

@@ -167,6 +167,7 @@ class Dreamer(tools.Module):
       likes = tools.AttrDict()
       likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
       likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
+
       phy_loss = tf.reduce_mean(tf.square(physics_pred - data['physics']))
       #print('I care')
       #print(physics_pred.mode().shape)
