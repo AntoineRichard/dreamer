@@ -33,19 +33,20 @@ def define_config():
   # General.
   config.logdir = pathlib.Path('.')
   config.seed = 0
-  config.steps = 5e6
+  config.steps = 1.5e6
   config.eval_every = 5000
   config.log_every = 1e3
   config.log_scalars = True
   config.log_images = True
   config.gpu_growth = True
   config.precision = 32
+  config.port = 8080
   # Environment.
   config.task = 'dmc_walker_walk'
   config.envs = 1
   config.parallel = 'none'
   config.action_repeat = 1
-  config.time_limit = 1000
+  config.time_limit = 500
   config.prefill = 5000
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
@@ -74,7 +75,7 @@ def define_config():
   config.grad_clip = 100.0
   config.dataset_balance = False
   # Behavior.
-  config.discount = 0.997
+  config.discount = 0.97
   config.disclam = 0.95
   config.horizon = 15
   config.action_dist = 'tanh_normal'
@@ -354,6 +355,13 @@ def summarize_episode(config, datadir, writer, prefix):
     #if prefix == 'test':
     tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
 
+def get_last_episode_reward(config, datadir, writer):
+  list_of_files = glob.glob(str(datadir)+'/*.npz')
+  latest_file = max(list_of_files, key=os.path.getctime)
+  episode = np.load(latest_file)
+  episode = {k: episode[k] for k in episode.keys()}
+  ret = float(episode['reward'][-int(len(episode['reward'])/2):].sum())
+  return ret
 
 def make_env(config, writer, prefix, datadir, store):
   suite, task = config.task.split('_', 1)
@@ -401,13 +409,12 @@ def main(config):
 
   has_trained = False
   
-  steps = count_steps(datadir, config)
-  # Warm Up
-  if steps < 100:
-    c = http.client.HTTPConnection('localhost', 8080)
-    c.request('POST', '/toServer', '{"random": 1, "steps":500, "repeat":4, "discount":1.0, "training": 1}')
-    doc = c.getresponse().read()
   step = count_steps(datadir, config)
+  # Warm Up
+  if step < 2000:
+    c = http.client.HTTPConnection('localhost', config.port)
+    c.request('POST', '/toServer', '{"random": 1, "steps":'+str(agent._c.time_limit)+', "repeat":4, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(-10000)+'}')
+    doc = c.getresponse().read()
   agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Loading checkpoint.')
@@ -416,12 +423,12 @@ def main(config):
   # Train and Evaluate continously
   while step < config.steps:
     step = count_steps(datadir, config)
+    reward = get_last_episode_reward(config, datadir, writer)
     if (step % config.eval_every == 0) and (has_trained):
       print('Evaluating')
-      c = http.client.HTTPConnection('localhost', 8080)
-      c.request('POST', '/toServer', '{"random": 0, "steps":1000, "repeat":0, "discount":1.0, "training": 0}')
+      c = http.client.HTTPConnection('localhost', config.port)
+      c.request('POST', '/toServer', '{"random": 0, "steps":'+str(agent._c.time_limit)+', "repeat":0, "discount":1.0, "training": 0, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
       doc = c.getresponse().read()
-
       summarize_episode(config, datadir, agent._writer, 'train')
       summarize_episode(config, testdir, agent._writer, 'test')
     # Train
@@ -446,8 +453,8 @@ def main(config):
 
     # Request a new episode from ROS
     print('Playing')
-    c = http.client.HTTPConnection('localhost', 8080)
-    c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 1}')
+    c = http.client.HTTPConnection('localhost', config.port)
+    c.request('POST', '/toServer', '{"random": 0, "steps":'+str(agent._c.time_limit)+', "repeat":0, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
     doc = c.getresponse().read()
 
 
