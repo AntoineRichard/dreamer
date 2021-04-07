@@ -75,7 +75,7 @@ def define_config():
   config.grad_clip = 100.0
   config.dataset_balance = False
   # Behavior.
-  config.discount = 0.997
+  config.discount = 0.90
   config.disclam = 0.95
   config.horizon = 15
   config.action_dist = 'tanh_normal'

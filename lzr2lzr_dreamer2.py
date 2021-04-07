@@ -34,7 +34,7 @@ def define_config():
   config.logdir = pathlib.Path('.')
   config.seed = 0
   config.steps = 1.5e6
-  config.eval_every = 3000
+  config.eval_every = 5000
   config.log_every = 1e3
   config.log_scalars = True
   config.log_images = True
@@ -46,7 +46,7 @@ def define_config():
   config.envs = 1
   config.parallel = 'none'
   config.action_repeat = 1
-  config.time_limit = 300
+  config.time_limit = 500
   config.prefill = 5000
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
@@ -139,10 +139,10 @@ class Dreamer(tools.Module):
       embed = self._encode(data)
       post, prior = self._dynamics.observe(embed, data['action'])
       feat = self._dynamics.get_feat(post)
-      image_pred = self._decode(feat)
+      laser_pred = self._decode(feat)
       reward_pred = self._reward(feat)
       likes = tools.AttrDict()
-      likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
+      likes.laser = tf.reduce_mean(laser_pred.log_prob(data['laser']))
       likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
       if self._c.pcont:
         pcont_pred = self._pcont(feat)
@@ -184,9 +184,6 @@ class Dreamer(tools.Module):
           data, feat, prior_dist, post_dist, likes, div,
           model_loss, value_loss, actor_loss, model_norm, value_norm,
           actor_norm)
-    if tf.equal(log_images, True):
-      self._image_summaries(data, embed, image_pred)
-
 
   def _build_model(self):
     acts = dict(
@@ -197,7 +194,7 @@ class Dreamer(tools.Module):
     self._encode = models.LaserConvEncoder(self._c.cnn_depth, cnn_act)
     self._dynamics = models.RSSM(
         self._c.stoch_size, self._c.deter_size, self._c.deter_size)
-    self._decode = models.ConvDecoder(self._c.cnn_depth, cnn_act)
+    self._decode = models.LaserDecoder(self._c.cnn_depth, cnn_act)
     self._reward = models.DenseDecoder((), 2, self._c.num_units, act=act)
     if self._c.pcont:
       self._pcont = models.DenseDecoder(
@@ -307,8 +304,6 @@ def preprocess(obs, config):
   with tf.device('cpu:0'):
     print(obs['laser'])
     obs['laser'] = tf.cast(1/obs['laser'] - 0.5, dtype)
-    obs['intensity'] = tf.cast(obs['intensity'], dtype)
-    obs['laser'] = tf.concat([obs['laser'], obs['intensity']],axis=-1)
     print(obs['laser'].shape)
     obs['image'] = tf.cast(obs['image'], dtype) / 255.0 - 0.5
     clip_rewards = dict(none=lambda x: x, tanh=tf.tanh)[config.clip_rewards]
@@ -354,8 +349,6 @@ def summarize_episode(config, datadir, writer, prefix):
   with writer.as_default():  # Env might run in a different thread.
     tf.summary.experimental.set_step(step)
     [tf.summary.scalar('sim/' + k, v) for k, v in metrics]
-    #if prefix == 'test':
-    tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
 
 def get_last_episode_reward(config, datadir, writer):
   list_of_files = glob.glob(str(datadir)+'/*.npz')
@@ -415,9 +408,8 @@ def main(config):
   # Warm Up
   if step < 2000:
     c = http.client.HTTPConnection('localhost', config.port)
-    c.request('POST', '/toServer', '{"random": 1, "steps":'+str(config.time_limit)+', "repeat":4, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(-10000)+'}')
+    c.request('POST', '/toServer', '{"random": 1, "steps":'+str(agent._c.time_limit)+', "repeat":4, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(-10000)+'}')
     doc = c.getresponse().read()
-
   agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Loading checkpoint.')
@@ -430,9 +422,8 @@ def main(config):
     if (step % config.eval_every == 0) and (has_trained):
       print('Evaluating')
       c = http.client.HTTPConnection('localhost', config.port)
-      c.request('POST', '/toServer', '{"random": 0, "steps":'+str(config.time_limit)+', "repeat":0, "discount":1.0, "training": 0, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
+      c.request('POST', '/toServer', '{"random": 0, "steps":'+str(agent._c.time_limit)+', "repeat":0, "discount":1.0, "training": 0, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
       doc = c.getresponse().read()
-
       summarize_episode(config, datadir, agent._writer, 'train')
       summarize_episode(config, testdir, agent._writer, 'test')
     # Train
@@ -458,7 +449,7 @@ def main(config):
     # Request a new episode from ROS
     print('Playing')
     c = http.client.HTTPConnection('localhost', config.port)
-    c.request('POST', '/toServer', '{"random": 0, "steps":'+str(config.time_limit)+', "repeat":0, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
+    c.request('POST', '/toServer', '{"random": 0, "steps":'+str(agent._c.time_limit)+', "repeat":0, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
     doc = c.getresponse().read()
 
 

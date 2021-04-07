@@ -413,7 +413,7 @@ def main(config):
   # Warm Up
   if step < 2000:
     c = http.client.HTTPConnection('localhost', config.port)
-    c.request('POST', '/toServer', '{"random": 1, "steps":'+str(agent._c.time_limit)+', "repeat":4, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(-10000)+'}')
+    c.request('POST', '/toServer', '{"random": 1, "steps":'+str(config.time_limit)+', "repeat":4, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(-10000)+'}')
     doc = c.getresponse().read()
   agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
@@ -427,7 +427,7 @@ def main(config):
     if (step % config.eval_every == 0) and (has_trained):
       print('Evaluating')
       c = http.client.HTTPConnection('localhost', config.port)
-      c.request('POST', '/toServer', '{"random": 0, "steps":'+str(agent._c.time_limit)+', "repeat":0, "discount":1.0, "training": 0, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
+      c.request('POST', '/toServer', '{"random": 0, "steps":'+str(config.time_limit)+', "repeat":0, "discount":1.0, "training": 0, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
       doc = c.getresponse().read()
       summarize_episode(config, datadir, agent._writer, 'train')
       summarize_episode(config, testdir, agent._writer, 'test')
@@ -454,7 +454,7 @@ def main(config):
     # Request a new episode from ROS
     print('Playing')
     c = http.client.HTTPConnection('localhost', config.port)
-    c.request('POST', '/toServer', '{"random": 0, "steps":'+str(agent._c.time_limit)+', "repeat":0, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
+    c.request('POST', '/toServer', '{"random": 0, "steps":'+str(config.time_limit)+', "repeat":0, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
     doc = c.getresponse().read()
 
 
