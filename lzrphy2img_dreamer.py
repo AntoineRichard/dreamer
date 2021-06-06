@@ -111,24 +111,6 @@ class Dreamer(tools.Module):
     self._dataset = iter(load_dataset(datadir, self._c))
     self._build_model()
 
-  @tf.function
-  def policy(self, obs, state, training):
-    if state is None:
-      latent = self._dynamics.initial(len(obs['laser']))
-      action = tf.zeros((len(obs['laser']), self._actdim), self._float)
-    else:
-      latent, action = state
-    embed = self._encode(preprocess(obs, self._c))
-    latent, _ = self._dynamics.obs_step(latent, action, embed)
-    feat = self._dynamics.get_feat(latent)
-    if training:
-      action = self._actor(feat).sample()
-    else:
-      action = self._actor(feat).mode()
-    action = self._exploration(action, training)
-    state = (latent, action)
-    return action, state
-
   def load(self, filename):
     super().load(filename)
     self._should_pretrain()
@@ -205,8 +187,10 @@ class Dreamer(tools.Module):
           data, full_feat, env_prior_dist, env_post_dist, likes, env_div,
           env_loss, value_loss, actor_loss, env_norm, value_norm,
           actor_norm)
-    if tf.equal(log_images, True):
-      self._image_summaries(data, embed, image_pred, physics_pred)
+    #if tf.equal(log_images, True):
+    #  video = self._image_summaries(data)
+    #  rec_phy, rec_phy_std, true_phy = self._plot_summaries(data)
+
 
 
   def _build_model(self):
@@ -242,30 +226,6 @@ class Dreamer(tools.Module):
     # in multi-GPU mode.
     self.train(next(self._dataset))
 
-  def _exploration(self, action, training):
-    if training:
-      amount = self._c.expl_amount
-      if self._c.expl_decay:
-        amount *= 0.5 ** (tf.cast(self._step, tf.float32) / self._c.expl_decay)
-      if self._c.expl_min:
-        amount = tf.maximum(self._c.expl_min, amount)
-      #self._metrics['expl_amount'].update_state(amount)
-    elif self._c.eval_noise:
-      amount = self._c.eval_noise
-    else:
-      return action
-    if self._c.expl == 'additive_gaussian':
-      return tf.clip_by_value(tfd.Normal(action, amount).sample(), -1, 1)
-    if self._c.expl == 'completely_random':
-      return tf.random.uniform(action.shape, -1, 1)
-    if self._c.expl == 'epsilon_greedy':
-      indices = tfd.Categorical(0 * action).sample()
-      return tf.where(
-          tf.random.uniform(action.shape[:1], 0, 1) < amount,
-          tf.one_hot(indices, action.shape[-1], dtype=self._float),
-          action)
-    raise NotImplementedError(self._c.expl)
-
   def _imagine_ahead(self, env_post, phy_post):
     if self._c.pcont:  # Last step could be terminal.
       post = {k: v[:, :-1] for k, v in post.items()}
@@ -278,7 +238,7 @@ class Dreamer(tools.Module):
     policy = lambda env_state, phy_state: self._actor(
         tf.concat([tf.stop_gradient(self._env_dynamics.get_feat(env_state)),
                          tf.stop_gradient(self._phy_dynamics.get_feat(phy_state))],-1)).sample()
-    physics = lambda state: tf.stop_gradient(self._physics(self._phy_dynamics.get_feat(state)).mode())
+    physics = lambda state: self._physics(self._phy_dynamics.get_feat(state)).mode()
     # Run imagination
     env_states, phy_states = tools.forward_sync_RSSMv2(
         self._env_dynamics.img_step,
@@ -309,35 +269,44 @@ class Dreamer(tools.Module):
     self._metrics['actor_loss'].update_state(actor_loss)
     self._metrics['action_ent'].update_state(self._actor(feat).entropy())
 
-  def _image_summaries(self, data, embed, image_pred, phy_pred):
+  @tf.function
+  def image_summaries(self, data):
     # Real 
     env_truth = data['image'][:6] + 0.5
-    phy_truth = data['physics'][:6]
-    # Reconstructions
-    phy_rec = phy_pred.mode()[:6]
-    env_rec = image_pred.mode()[:6]
     # Initial states (5 steps warmup)
+    embed = self.encoder(data)
     env_init, _ = self._env_dynamics.observe(embed[:6, :5], data['prev_phy'][:6, :5])
-    phy_init, _ = self._phy_dynamics.observe(data['input_phy'][:6, :5], data['action'][:6, :5])
     env_init = {k: v[:, -1] for k, v in env_init.items()}
-    phy_init = {k: v[:, -1] for k, v in phy_init.items()}
     # Environment imagination
     env_prior = self._env_dynamics.imagine(data['prev_phy'][:6, 5:], env_init) 
     env_feat = self._env_dynamics.get_feat(env_prior)
-    # Physics imagination
-    phy_prior = self._phy_dynamics.imagine(data['action'][:6, 5:], phy_init, sample=False)
-    phy_feat = self._phy_dynamics.get_feat(phy_prior)
     # Environment reconstruction
     openl = self._decode(env_feat).mode()
     env_model = tf.concat([env_rec[:, :5] + 0.5, openl + 0.5], 1)
     error = (env_model - env_truth + 1) / 2
     openl = tf.concat([env_truth, env_model, error], 2)
-    tools.graph_summary(self._writer, tools.video_summary, 'agent/environment_reconstruction', openl)
+    return openl
+
+  @tf.function
+  def plot_dynamics(self, data):
+    # Real 
+    phy_truth = data['physics'][:6]
+    # Initial states (5 steps warmup)
+    phy_init, _ = self._phy_dynamics.observe(data['input_phy'][:6, :5], data['action'][:6, :5])
+    phy_init_feat = self._phy_dynamics.get_feat(phy_init)
+    # Physics imagination
+    phy_prior = self._phy_dynamics.imagine(data['action'][:6, 5:], phy_init, sample=False)
+    phy_feat = self._phy_dynamics.get_feat(phy_prior)
     # Physics reconstruction
+    phy_obs = self._physics(phy_init_feat).mode()
     phy_pred = self._physics(phy_feat).mode()
-    phy_model = tf.concat([phy_rec[:, :5], phy_pred], 1)
-    phy = tf.concat([phy_truth, phy_model], 1)
-    tools.graph_summary(self._writer, tools.plot_summary, 'agent/physics_reconstruction', phy)
+    # Uncertainty
+    phy_obs_std = self._physics(phy_init_feat).stddev()
+    phy_pred_std = self._physics(phy_feat).stddev()
+    # Concat and dump
+    phy_model = tf.concat([phy_obs[:, :5], phy_pred], 1)
+    phy_model_std = tf.concat([phy_obs_std[:, :5], phy_pred_std], 1)
+    return phy_model, phy_model_std, phy_truth
 
   def _write_summaries(self):
     step = int(self._step.numpy())
@@ -385,8 +354,7 @@ def load_dataset(directory, config):
   dataset = dataset.prefetch(10)
   return dataset
 
-
-def summarize_episode(config, datadir, writer, prefix):
+def summarize_episode(config, datadir, writer, prefix, step):
   list_of_files = glob.glob(str(datadir)+'/*.npz')
   latest_file = max(list_of_files, key=os.path.getctime)
   episode = np.load(latest_file)
@@ -407,8 +375,12 @@ def summarize_episode(config, datadir, writer, prefix):
     tf.summary.experimental.set_step(step)
     [tf.summary.scalar('sim/' + k, v) for k, v in metrics]
     #if prefix == 'test':
-    tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
+    tools.video_summary(f'sim/{prefix}/video', episode['image'][None], step=step)
 
+def summarize_train(data, step, writer):
+    tools.video_summary('agent/environment_reconstruction',agent.image_summaries(data),step = step)
+    rec_phy, rec_phy_std, true_phy = agent.plot_dynamics(data)
+    tools.plot_summary('agent/dynamics_reconstruction', rec_phy, rec_phy_std, true_phy, )
 
 def make_env(config, writer, prefix, datadir, store):
   suite, task = config.task.split('_', 1)
@@ -497,9 +469,9 @@ def main(config):
     #log = agent._should_log(step)
     log = True
     for train_step in range(100):
-      log_images = agent._c.log_images and log and (train_step == 0)
-      agent.train(next(agent._dataset), log_images)
-    if log:
+      data = next(agent._dataset)
+      agent.train(data)
+    if log:  
       agent._write_summaries()
     has_trained=True
 

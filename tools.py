@@ -59,7 +59,6 @@ def graph_summary(writer, fn, *args):
       fn(*args)
   return tf.numpy_function(inner, args, [])
 
-
 def video_summary(name, video, step=None, fps=20):
   name = name if isinstance(name, str) else name.decode('utf-8')
   #print(video)
@@ -77,7 +76,6 @@ def video_summary(name, video, step=None, fps=20):
     print('GIF summaries require ffmpeg in $PATH.', e)
     frames = video.transpose((0, 2, 1, 3, 4)).reshape((1, B * H, T * W, C))
     tf.summary.image(name + '/grid', frames, step)
-
 
 def encode_gif(frames, fps):
   from subprocess import Popen, PIPE
@@ -97,6 +95,31 @@ def encode_gif(frames, fps):
   del proc
   return out
 
+def plot_summary(name, rec, rec_std, true, step=step):
+    name = name if isinstance(name, str) else name.decode('utf-8')
+    states = []
+    # Format --> [B,T,S]
+    for i in range(true.shape[0]):
+	batch = []
+	for j in range(true.shape[-1]):
+	    f = plt.figure()
+            plt.fill_between(np.arange(true.shape[1]), rec[i,:,j]-rec_std,rec[i,:,j]+rec_std[i,:,j], color='cornflowerblue', alpha=0.3, label='stddev')
+            plt.plot(true[i,:,j], '--',color='k', label='true')
+            plt.plot(rec[i,:,j], color='red', label='reconstructed')
+            plt.legend()
+            plt.xlabel('time step')
+            plt.ylabel('velocity (m/s)')
+       	    f.canvas.draw()
+            buff = f.canvas.tostring_rgb()
+            ncols, nrows = f.canvas.get_width_height()
+            img = np.frombuffer(buff, dtype=np.uint8).reshape(nrows, ncols, 3)
+            plt.close(f)
+            batch.append(img)
+	states.append(batch)
+    states = np.array(states)
+    for i in range(true.shape[-1]):
+        img = np.concatenate(states[:,i],1)
+	tf.summary.image(name+'_'+str(i), img, step=step)
 
 def simulate(agent, envs, steps=0, episodes=0, state=None):
   # Initialize or unpack simulation state.
