@@ -282,47 +282,6 @@ class DenseDecoder(tools.Module):
       return tfd.Independent(tfd.Bernoulli(x), len(self._shape))
     raise NotImplementedError(self._dist)
 
-class DenseDecoderDet(tools.Module):
-
-  def __init__(self, shape, layers, units, dist='normal', act=tf.nn.elu):
-    self._shape = shape
-    self._layers = layers
-    self._units = units
-    self._dist = dist
-    self._act = act
-
-  def __call__(self, features):
-    x = features
-    for index in range(self._layers):
-      x = self.get(f'h{index}', tfkl.Dense, self._units, self._act)(x)
-    x = self.get(f'hout', tfkl.Dense, np.prod(self._shape))(x)
-    x = tf.reshape(x, tf.concat([tf.shape(features)[:-1], self._shape], 0))
-    return x
-
-class PhysicalModel(tools.Module):
-
-  def __init__(self, shape, layers, units, dist='normal', act=tf.nn.elu):
-    self._shape = shape
-    self._layers = layers
-    self._units = units
-    self._dist = dist
-    self._act = act
-
-  def __call__(self, phy, actions):
-    x = phy
-    u = actions
-
-    nl = self.get('nl1', tfkl.Dense, self._units, self._act)(tf.concatenate((x,u),axis=-1))
-    nl = self.get('nl2', tfkl.Dense, self._units, self._act)(nl)
-    nl = self.get('nl3', tfkl.Dense, self._shape)(nl)
-
-    a = self.get('a', tfkl.Dense, self._shape, use_bias=False)(x)
-    b = self.get('b', tfkl.Dense, self._shape, use_bias=False)(u)
-
-    dyn_lin = a + b
-    dyn = a + b + nl
-    return dyn_lin, nl, dyn
-
 class ActionDecoder(tools.Module):
 
   def __init__(
