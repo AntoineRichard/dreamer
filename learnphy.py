@@ -116,10 +116,10 @@ class Dreamer(tools.Module):
     self._should_pretrain()
 
   @tf.function()
-  def train(self, data, log_images=False):
-    self._train(data, log_images)
+  def train(self, data):
+    self._train(data)
 
-  def _train(self, data, log_images):
+  def _train(self, data):
     # World Model
     
     likes = tools.AttrDict()
@@ -146,8 +146,6 @@ class Dreamer(tools.Module):
       self._scalar_summaries(
           phy_prior_dist, phy_post_dist, likes, phy_div,
           phy_loss, phy_norm)
-    if tf.equal(log_images, True):
-      self._image_summaries(data, physics_pred)
 
 
   def _build_model(self):
@@ -174,35 +172,26 @@ class Dreamer(tools.Module):
     self._metrics['phy_div'].update_state(div)
     self._metrics['phy_loss'].update_state(phy_loss)
 
-  def _image_summaries(self, data, phy_pred):
+  @tf.function
+  def plot_dynamics(self, data):
     # Real 
     phy_truth = data['physics'][:6]
-    # Reconstructions
-    phy_rec = phy_pred.mode()[:6]
     # Initial states (5 steps warmup)
     phy_init, _ = self._phy_dynamics.observe(data['input_phy'][:6, :5], data['action'][:6, :5])
-    phy_init = {k: v[:, -1] for k, v in phy_init.items()}
+    phy_init_feat = self._phy_dynamics.get_feat(phy_init)
     # Physics imagination
-    phy_prior = self._phy_dynamics.imagine(data['action'][:6, 5:], phy_init,
-            sample=True)
+    phy_prior = self._phy_dynamics.imagine(data['action'][:6, 5:], phy_init, sample=False)
     phy_feat = self._phy_dynamics.get_feat(phy_prior)
     # Physics reconstruction
+    phy_obs = self._physics(phy_init_feat).mode()
     phy_pred = self._physics(phy_feat).mode()
-    phy_model = tf.concat([phy_rec[:, :5], phy_pred], 1)
-    phy = tf.concat([phy_truth, phy_model], 1)
-    tools.graph_summary(self._writer, tools.plot_summary, 'agent/physics_reconstruction', phy)
-    # Initial states (5 steps warmup)
-    phy_init, _ = self._phy_dynamics.observe(data['input_phy'][:6, :5], data['action'][:6, :5])
-    phy_init = {k: v[:, -1] for k, v in phy_init.items()}
-    # Physics imagination no sampling
-    phy_prior = self._phy_dynamics.imagine(data['action'][:6, 5:], phy_init,
-            sample=False)
-    phy_feat = self._phy_dynamics.get_feat(phy_prior)
-    # Physics reconstruction
-    phy_pred = self._physics(phy_feat).mode()
-    phy_model = tf.concat([phy_rec[:, :5], phy_pred], 1)
-    phy = tf.concat([phy_truth, phy_model], 1)
-    tools.graph_summary(self._writer, tools.plot_summary, 'agent/physics_reconstruction_ns', phy)
+    # Uncertainty
+    phy_obs_std = self._physics(phy_init_feat).stddev()
+    phy_pred_std = self._physics(phy_feat).stddev()
+    # Concat and dump
+    phy_model = tf.concat([phy_obs[:, :5], phy_pred], 1)
+    phy_model_std = tf.concat([phy_obs_std[:, :5], phy_pred_std], 1)
+    return phy_model, phy_model_std, phy_truth
 
   def _write_summaries(self):
     step = int(self._step.numpy())
@@ -218,6 +207,12 @@ class Dreamer(tools.Module):
     [tf.summary.scalar('agent/' + k, m) for k, m in metrics]
     print(f'[{step}]', ' / '.join(f'{k} {v:.1f}' for k, v in metrics))
     self._writer.flush()
+
+def summarize_train(data, step, writer):
+  with writer.as_default(): 
+    tf.summary.experimental.set_step(step)
+    rec_phy, rec_phy_std, true_phy = agent.plot_dynamics(data)
+    tools.plot_summary('agent/dynamics_reconstruction', rec_phy, rec_phy_std, true_phy, step=step)
 
 def preprocess(obs, config):
   dtype = prec.global_policy().compute_dtype
@@ -281,8 +276,10 @@ def main(config):
     log = agent._should_log(step)
     for train_step in range(100):
       log_images = agent._c.log_images and log and (train_step == 0)
-      agent.train(next(agent._dataset), log_images)
+      data = next(agent._dataset
+      agent.train(data)
     if log:
+      summarize_train(data, agent._writer, step)
       agent._write_summaries()
     step += 100
 

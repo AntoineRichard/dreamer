@@ -187,11 +187,6 @@ class Dreamer(tools.Module):
           data, full_feat, env_prior_dist, env_post_dist, likes, env_div,
           env_loss, value_loss, actor_loss, env_norm, value_norm,
           actor_norm)
-    #if tf.equal(log_images, True):
-    #  video = self._image_summaries(data)
-    #  rec_phy, rec_phy_std, true_phy = self._plot_summaries(data)
-
-
 
   def _build_model(self):
     acts = dict(
@@ -378,9 +373,11 @@ def summarize_episode(config, datadir, writer, prefix, step):
     tools.video_summary(f'sim/{prefix}/video', episode['image'][None], step=step)
 
 def summarize_train(data, step, writer):
+  with writer.as_default(): 
+    tf.summary.experimental.set_step(step)
     tools.video_summary('agent/environment_reconstruction',agent.image_summaries(data),step = step)
     rec_phy, rec_phy_std, true_phy = agent.plot_dynamics(data)
-    tools.plot_summary('agent/dynamics_reconstruction', rec_phy, rec_phy_std, true_phy, )
+    tools.plot_summary('agent/dynamics_reconstruction', rec_phy, rec_phy_std, true_phy, step=step)
 
 def make_env(config, writer, prefix, datadir, store):
   suite, task = config.task.split('_', 1)
@@ -458,8 +455,8 @@ def main(config):
       c = http.client.HTTPConnection('localhost', 8080)
       c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 0}')
       doc = c.getresponse().read()
-      summarize_episode(config, datadir, agent._writer, 'train')
-      summarize_episode(config, testdir, agent._writer, 'test')
+      summarize_episode(config, datadir, agent._writer, 'train', step)
+      summarize_episode(config, testdir, agent._writer, 'test', step)
     # Train
     print('Training for 100 steps')
     agent._step.assign(step)
@@ -472,6 +469,7 @@ def main(config):
       data = next(agent._dataset)
       agent.train(data)
     if log:  
+      summarize_train(data, agent._writer, step)
       agent._write_summaries()
     has_trained=True
 
