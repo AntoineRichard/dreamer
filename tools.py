@@ -408,6 +408,41 @@ def static_scan(fn, inputs, start, reverse=False):
   outputs = [tf.stack(x, 0) for x in outputs]
   return tf.nest.pack_sequence_as(start, outputs)
 
+def static_scan_no_sampling(fn, inputs, start, reverse=False):
+  last = start
+  outputs = [[] for _ in tf.nest.flatten(start)]
+  indices = range(len(tf.nest.flatten(inputs)[0]))
+  if reverse:
+    indices = reversed(indices)
+  for index in indices:
+    inp = tf.nest.map_structure(lambda x: x[index], inputs)
+    last = fn(last, inp, sample=False)
+    [o.append(l) for o, l in zip(outputs, tf.nest.flatten(last))]
+  if reverse:
+    outputs = [list(reversed(x)) for x in outputs]
+  outputs = [tf.stack(x, 0) for x in outputs]
+  return tf.nest.pack_sequence_as(start, outputs)
+
+def forward_sync_RSSMv2(env_dyn, phy_dyn, env_start, phy_start, policy, physics, inputs, reverse=False):
+  env_last = env_start
+  phy_last = phy_start
+  env_outputs = [[] for _ in tf.nest.flatten(env_start)]
+  phy_outputs = [[] for _ in tf.nest.flatten(phy_start)]
+  indices = range(len(tf.nest.flatten(inputs)[0]))
+  if reverse:
+    indices = reversed(indices)
+  for index in indices:
+    new_phy = phy_dyn(phy_last, policy(env_last, phy_last), sample=False)
+    env_last = env_dyn(env_last, tf.stop_gradient(physics(phy_last)))
+    phy_last = new_phy
+    [o.append(l) for o, l in zip(env_outputs, tf.nest.flatten(env_last))]
+    [o.append(l) for o, l in zip(phy_outputs, tf.nest.flatten(phy_last))]
+  if reverse:
+    env_outputs = [list(reversed(x)) for x in env_outputs]
+    phy_outputs = [list(reversed(x)) for x in phy_outputs]
+  env_outputs = [tf.stack(x, 0) for x in env_outputs]
+  phy_outputs = [tf.stack(x, 0) for x in phy_outputs]
+  return tf.nest.pack_sequence_as(env_start, env_outputs), tf.nest.pack_sequence_as(phy_start, phy_outputs)
 
 def _mnd_sample(self, sample_shape=(), seed=None, name='sample'):
   return tf.random.normal(

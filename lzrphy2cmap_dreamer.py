@@ -9,7 +9,7 @@ import sys
 import time
 import http.client
 from bottle import Bottle, request
-
+from matplotlib import pyplot as plt
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['MUJOCO_GL'] = 'egl'
 
@@ -50,9 +50,12 @@ def define_config():
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
   # Model.
-  config.deter_size = 200
+  config.deter_size = 300
   config.stoch_size = 30
   config.num_units = 400
+  config.phy_deter_size = 50
+  config.phy_stoch_size = 5
+  config.phy_num_units = 60
   config.dense_act = 'elu'
   config.cnn_act = 'relu'
   config.cnn_depth = 32
@@ -74,7 +77,7 @@ def define_config():
   config.grad_clip = 100.0
   config.dataset_balance = False
   # Behavior.
-  config.discount = 0.997
+  config.discount = 0.97
   config.disclam = 0.95
   config.horizon = 15
   config.action_dist = 'tanh_normal'
@@ -135,40 +138,51 @@ class Dreamer(tools.Module):
     self._train(data, log_images)
 
   def _train(self, data, log_images):
-    with tf.GradientTape() as model_tape:
+    likes = tools.AttrDict()
+    phy_post, phy_prior = self._phy_dynamics.observe(data['input_phy'], data['action'])
+    # Get features
+    phy_feat = self._phy_dynamics.get_feat(phy_post)
+    # Reconstruct
+    physics_pred = self._physics(phy_feat)
+ 
+    with tf.GradientTape() as env_tape:
+      # Observation
       embed = self._encode(data)
-      post, prior = self._dynamics.observe(embed, data['action'])
-      feat = self._dynamics.get_feat(post)
-      image_pred = self._decode(feat)
-      reward_pred = self._reward(feat)
-      # NEW
-      physics_pred = self._physics(feat)
-      # ---
-      likes = tools.AttrDict()
+      env_post, env_prior = self._env_dynamics.observe(embed, data['prev_phy'])
+      # Get features
+      img_feat = self._env_dynamics.get_feat(env_post)
+      full_feat = tf.concat([img_feat, tf.stop_gradient(phy_feat)],-1)
+      # Reconstruct
+      image_pred = self._decode(img_feat)
+      reward_pred = self._reward(full_feat)
+      # Reconstruction errors
       likes.image = tf.reduce_mean(image_pred.log_prob(data['image']))
       likes.reward = tf.reduce_mean(reward_pred.log_prob(data['reward']))
-      # NEW
-      likes.physics = tf.reduce_mean(physics_pred.log_prob(data['physics']))
-      # ---
+      # World model loss
       if self._c.pcont:
-        pcont_pred = self._pcont(feat)
+        pcont_pred = self._pcont(full_feat)
         pcont_target = self._c.discount * data['discount']
         likes.pcont = tf.reduce_mean(pcont_pred.log_prob(pcont_target))
         likes.pcont *= self._c.pcont_scale
-      prior_dist = self._dynamics.get_dist(prior)
-      post_dist = self._dynamics.get_dist(post)
-      div = tf.reduce_mean(tfd.kl_divergence(post_dist, prior_dist))
-      div = tf.maximum(div, self._c.free_nats)
-      model_loss = self._c.kl_scale * div - sum(likes.values())
-
+      # Maximize the use of the internal state
+      env_prior_dist = self._env_dynamics.get_dist(env_prior)
+      env_post_dist = self._env_dynamics.get_dist(env_post)
+      env_div = tf.reduce_mean(tfd.kl_divergence(env_post_dist, env_prior_dist))
+      env_div = tf.maximum(env_div, self._c.free_nats)
+      # World model loss
+      env_loss = - likes.reward - likes.image + self._c.kl_scale * env_div
+     
+    # Actor
     with tf.GradientTape() as actor_tape:
-      imag_feat = self._imagine_ahead(post)
-      reward = self._reward(imag_feat).mode()
+      # Imagination
+      img_env_feat, img_phy_feat, img_full_feat = self._imagine_ahead(env_post, phy_post)
+      # Actor training
+      reward = self._reward(img_full_feat).mode()
       if self._c.pcont:
-        pcont = self._pcont(imag_feat).mean()
+        pcont = self._pcont(img_env_feat).mean()
       else:
         pcont = self._c.discount * tf.ones_like(reward)
-      value = self._value(imag_feat).mode()
+      value = self._value(img_full_feat).mode()
       returns = tools.lambda_return(
           reward[:-1], value[:-1], pcont[:-1],
           bootstrap=value[-1], lambda_=self._c.disclam, axis=0)
@@ -176,22 +190,23 @@ class Dreamer(tools.Module):
           [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
       actor_loss = -tf.reduce_mean(discount * returns)
 
+    # Value
     with tf.GradientTape() as value_tape:
-      value_pred = self._value(imag_feat)[:-1]
+      value_pred = self._value(img_full_feat)[:-1]
       target = tf.stop_gradient(returns)
       value_loss = -tf.reduce_mean(discount * value_pred.log_prob(target))
 
-    model_norm = self._model_opt(model_tape, model_loss)
+    env_norm = self._env_opt(env_tape, env_loss)
     actor_norm = self._actor_opt(actor_tape, actor_loss)
     value_norm = self._value_opt(value_tape, value_loss)
 
     if self._c.log_scalars:
       self._scalar_summaries(
-          data, feat, prior_dist, post_dist, likes, div,
-          model_loss, value_loss, actor_loss, model_norm, value_norm,
+          data, full_feat, env_prior_dist, env_post_dist, likes, env_div,
+          env_loss, value_loss, actor_loss, env_norm, value_norm,
           actor_norm)
     if tf.equal(log_images, True):
-      self._image_summaries(data, embed, image_pred)
+      self._image_summaries(data, embed, image_pred, physics_pred)
 
 
   def _build_model(self):
@@ -200,14 +215,12 @@ class Dreamer(tools.Module):
         leaky_relu=tf.nn.leaky_relu)
     cnn_act = acts[self._c.cnn_act]
     act = acts[self._c.dense_act]
-    self._encode = models.LaserConvEncoderWithBypass(self._c.cnn_depth, cnn_act)
-    self._dynamics = models.RSSM(
-        self._c.stoch_size, self._c.deter_size, self._c.deter_size)
+    self._encode = models.LaserConvEncoder(self._c.cnn_depth, cnn_act)
+    self._env_dynamics = models.RSSMv2(self._c.stoch_size, self._c.deter_size, self._c.deter_size)
+    self._phy_dynamics = models.RSSMv2(self._c.phy_stoch_size, self._c.phy_deter_size, self._c.phy_deter_size)
     self._decode = models.ConvDecoder(self._c.cnn_depth, cnn_act)
     self._reward = models.DenseDecoder((), 2, self._c.num_units, act=act)
-    # NEW
-    self._physics = models.DenseDecoder((), 2, self._c.num_units, act=act)
-    # ---
+    self._physics = models.DenseDecoder([3], 1, self._c.phy_num_units, act=act)
     if self._c.pcont:
       self._pcont = models.DenseDecoder(
           (), 3, self._c.num_units, 'binary', act=act)
@@ -215,13 +228,13 @@ class Dreamer(tools.Module):
     self._actor = models.ActionDecoder(
         self._actdim, 4, self._c.num_units, self._c.action_dist,
         init_std=self._c.action_init_std, act=act)
-    model_modules = [self._encode, self._dynamics, self._decode, self._reward]
+    model_modules = [self._encode, self._env_dynamics, self._decode, self._reward]
     if self._c.pcont:
       model_modules.append(self._pcont)
     Optimizer = functools.partial(
         tools.Adam, wd=self._c.weight_decay, clip=self._c.grad_clip,
         wdpattern=self._c.weight_decay_pattern)
-    self._model_opt = Optimizer('model', model_modules, self._c.model_lr)
+    self._env_opt = Optimizer('model', model_modules, self._c.model_lr)
     self._value_opt = Optimizer('value', [self._value], self._c.value_lr)
     self._actor_opt = Optimizer('actor', [self._actor], self._c.actor_lr)
     # Do a train step to initialize all variables, including optimizer
@@ -253,18 +266,31 @@ class Dreamer(tools.Module):
           action)
     raise NotImplementedError(self._c.expl)
 
-  def _imagine_ahead(self, post):
+  def _imagine_ahead(self, env_post, phy_post):
     if self._c.pcont:  # Last step could be terminal.
       post = {k: v[:, :-1] for k, v in post.items()}
+    # Get initial states
     flatten = lambda x: tf.reshape(x, [-1] + list(x.shape[2:]))
-    start = {k: flatten(v) for k, v in post.items()}
-    policy = lambda state: self._actor(
-        tf.stop_gradient(self._dynamics.get_feat(state))).sample()
-    states = tools.static_scan(
-        lambda prev, _: self._dynamics.img_step(prev, policy(prev)),
-        tf.range(self._c.horizon), start)
-    imag_feat = self._dynamics.get_feat(states)
-    return imag_feat
+    env_start = {k: flatten(v) for k, v in env_post.items()}
+    phy_start = {k: flatten(v) for k, v in phy_post.items()}
+
+    # Define Policy and Physics functions
+    policy = lambda env_state, phy_state: self._actor(
+        tf.concat([tf.stop_gradient(self._env_dynamics.get_feat(env_state)),
+                         tf.stop_gradient(self._phy_dynamics.get_feat(phy_state))],-1)).sample()
+    physics = lambda state: tf.stop_gradient(self._physics(self._phy_dynamics.get_feat(state)).mode())
+    # Run imagination
+    env_states, phy_states = tools.forward_sync_RSSMv2(
+        self._env_dynamics.img_step,
+        self._phy_dynamics.img_step,
+        env_start, phy_start,
+        policy, physics,
+        tf.range(self._c.horizon))
+    # Collect features
+    img_env_feat = self._env_dynamics.get_feat(env_states)
+    img_phy_feat = self._phy_dynamics.get_feat(phy_states)
+    img_full_feat = tf.concat([img_env_feat, img_phy_feat],-1)
+    return img_env_feat, img_phy_feat, img_full_feat
 
   def _scalar_summaries(
       self, data, feat, prior_dist, post_dist, likes, div,
@@ -283,18 +309,35 @@ class Dreamer(tools.Module):
     self._metrics['actor_loss'].update_state(actor_loss)
     self._metrics['action_ent'].update_state(self._actor(feat).entropy())
 
-  def _image_summaries(self, data, embed, image_pred):
-    truth = data['image'][:6] + 0.5
-    recon = image_pred.mode()[:6]
-    init, _ = self._dynamics.observe(embed[:6, :5], data['action'][:6, :5])
-    init = {k: v[:, -1] for k, v in init.items()}
-    prior = self._dynamics.imagine(data['action'][:6, 5:], init)
-    openl = self._decode(self._dynamics.get_feat(prior)).mode()
-    model = tf.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
-    error = (model - truth + 1) / 2
-    openl = tf.concat([truth, model, error], 2)
-    tools.graph_summary(
-        self._writer, tools.video_summary, 'agent/openl', openl)
+  def _image_summaries(self, data, embed, image_pred, phy_pred):
+    # Real 
+    env_truth = data['image'][:6] + 0.5
+    phy_truth = data['physics'][:6]
+    # Reconstructions
+    phy_rec = phy_pred.mode()[:6]
+    env_rec = image_pred.mode()[:6]
+    # Initial states (5 steps warmup)
+    env_init, _ = self._env_dynamics.observe(embed[:6, :5], data['prev_phy'][:6, :5])
+    phy_init, _ = self._phy_dynamics.observe(data['input_phy'][:6, :5], data['action'][:6, :5])
+    env_init = {k: v[:, -1] for k, v in env_init.items()}
+    phy_init = {k: v[:, -1] for k, v in phy_init.items()}
+    # Environment imagination
+    env_prior = self._env_dynamics.imagine(data['prev_phy'][:6, 5:], env_init) 
+    env_feat = self._env_dynamics.get_feat(env_prior)
+    # Physics imagination
+    phy_prior = self._phy_dynamics.imagine(data['action'][:6, 5:], phy_init, sample=False)
+    phy_feat = self._phy_dynamics.get_feat(phy_prior)
+    # Environment reconstruction
+    openl = self._decode(env_feat).mode()
+    env_model = tf.concat([env_rec[:, :5] + 0.5, openl + 0.5], 1)
+    error = (env_model - env_truth + 1) / 2
+    openl = tf.concat([env_truth, env_model, error], 2)
+    tools.graph_summary(self._writer, tools.video_summary, 'agent/environment_reconstruction', openl)
+    # Physics reconstruction
+    phy_pred = self._physics(phy_feat).mode()
+    phy_model = tf.concat([phy_rec[:, :5], phy_pred], 1)
+    phy = tf.concat([phy_truth, phy_model], 1)
+    tools.graph_summary(self._writer, tools.plot_summary, 'agent/physics_reconstruction', phy)
 
   def _write_summaries(self):
     step = int(self._step.numpy())
@@ -315,12 +358,10 @@ def preprocess(obs, config):
   dtype = prec.global_policy().compute_dtype
   obs = obs.copy()
   with tf.device('cpu:0'):
-    print(obs['laser'])
-    print(obs['vel_as_laser'])
-    #obs['laser'] = tf.concat([tf.cast(1/obs['laser'] - 0.5, dtype), tf.cast(obs['vel_as_laser'], dtype)], axis=-1)
+    #obs['input_phy'] = tf.cast(tf.expand_dims(obs['physics'],-1),dtype)
+    obs['input_phy'] = tf.cast(obs['physics'],dtype)
+    obs['prev_phy'] = tf.cast(obs['physics_d'],dtype)
     obs['laser'] = tf.cast(1/obs['laser'] - 0.5, dtype)
-    obs['vel_as_laser'] = tf.squeeze(tf.cast(obs['vel_as_laser'], dtype))
-    print(obs['laser'].shape)
     obs['image'] = tf.cast(obs['image'], dtype) / 255.0 - 0.5
     clip_rewards = dict(none=lambda x: x, tanh=tf.tanh)[config.clip_rewards]
     obs['reward'] = clip_rewards(obs['reward'])
@@ -419,23 +460,31 @@ def main(config):
   # Warm Up
   if steps < 100:
     c = http.client.HTTPConnection('localhost', 8080)
-    c.request('POST', '/toServer', '{"random": 1, "steps":500, "repeat":4, "discount":1.0, "training": 1}')
+    c.request('POST', '/toServer', '{"random": 1, "steps":250, "repeat":4, "discount":1.0, "training": 1}')
     doc = c.getresponse().read()
   step = count_steps(datadir, config)
   agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Loading checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
-  keys = ['image','reward']
+
+  if (config.logdir / 'phy_dynamics_weights.pkl').exists():
+    print('Loading physics_dynamics.')
+    agent._phy_dynamics.load(config.logdir / 'phy_dynamics_weights.pkl')
+  if (config.logdir / 'physics_weights.pkl').exists():
+    print('Loading physics_reconstruction')
+    agent._physics.load(config.logdir / 'physics_weights.pkl')
+
   training = True
 
   # Train and Evaluate continously
   while step < config.steps:
+    plt.close('all')
     step = count_steps(datadir, config)
     if (step % config.eval_every == 0) and (has_trained):
       print('Evaluating')
       c = http.client.HTTPConnection('localhost', 8080)
-      c.request('POST', '/toServer', '{"random": 0, "steps":1000, "repeat":0, "discount":1.0, "training": 0}')
+      c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 0}')
       doc = c.getresponse().read()
       summarize_episode(config, datadir, agent._writer, 'train')
       summarize_episode(config, testdir, agent._writer, 'test')
@@ -445,24 +494,26 @@ def main(config):
     step = agent._step.numpy().item()
     tf.summary.experimental.set_step(step)
 
-    log = agent._should_log(step)
+    #log = agent._should_log(step)
+    log = True
     for train_step in range(100):
       log_images = agent._c.log_images and log and (train_step == 0)
       agent.train(next(agent._dataset), log_images)
     if log:
       agent._write_summaries()
     has_trained=True
+
     # Save model after each training so ROS can load the new one.
     agent.save(config.logdir / 'variables.pkl')
     agent._encode.save(os.path.join(config.logdir,'encoder_weights.pkl'))
     agent._decode.save(os.path.join(config.logdir,'decoder_weights.pkl'))
-    agent._dynamics.save(os.path.join(config.logdir,'dynamics_weights.pkl'))
+    agent._env_dynamics.save(os.path.join(config.logdir,'env_dynamics_weights.pkl'))
     agent._actor.save(os.path.join(config.logdir,'actor_weights.pkl'))
 
     # Request a new episode from ROS
     print('Playing')
     c = http.client.HTTPConnection('localhost', 8080)
-    c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 1}')
+    c.request('POST', '/toServer', '{"random": 0, "steps":250, "repeat":0, "discount":1.0, "training": 1}')
     doc = c.getresponse().read()
 
 if __name__ == '__main__':
