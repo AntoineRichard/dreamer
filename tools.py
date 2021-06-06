@@ -10,9 +10,10 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.compat.v1 as tf1
 import tensorflow_probability as tfp
+
 from tensorflow.keras.mixed_precision import experimental as prec
 from tensorflow_probability import distributions as tfd
-
+from matplotlib import pyplot as plt
 
 class AttrDict(dict):
 
@@ -95,31 +96,32 @@ def encode_gif(frames, fps):
   del proc
   return out
 
-def plot_summary(name, rec, rec_std, true, step=step):
-    name = name if isinstance(name, str) else name.decode('utf-8')
-    states = []
-    # Format --> [B,T,S]
-    for i in range(true.shape[0]):
-	batch = []
-	for j in range(true.shape[-1]):
-	    f = plt.figure()
-            plt.fill_between(np.arange(true.shape[1]), rec[i,:,j]-rec_std,rec[i,:,j]+rec_std[i,:,j], color='cornflowerblue', alpha=0.3, label='stddev')
-            plt.plot(true[i,:,j], '--',color='k', label='true')
-            plt.plot(rec[i,:,j], color='red', label='reconstructed')
-            plt.legend()
-            plt.xlabel('time step')
-            plt.ylabel('velocity (m/s)')
-       	    f.canvas.draw()
-            buff = f.canvas.tostring_rgb()
-            ncols, nrows = f.canvas.get_width_height()
-            img = np.frombuffer(buff, dtype=np.uint8).reshape(nrows, ncols, 3)
-            plt.close(f)
-            batch.append(img)
-	states.append(batch)
-    states = np.array(states)
-    for i in range(true.shape[-1]):
-        img = np.concatenate(states[:,i],1)
-	tf.summary.image(name+'_'+str(i), img, step=step)
+def plot_summary(name, rec, rec_std, true, step=None):
+  name = name if isinstance(name, str) else name.decode('utf-8')
+  states = []
+  # Format --> [B,T,S]
+  for i in range(true.shape[0]):
+    batch = []
+    for j in range(true.shape[-1]):
+      f = plt.figure()
+      plt.fill_between(np.arange(true.shape[1]), rec[i,:,j]-rec_std[i,:,j], rec[i,:,j]+rec_std[i,:,j], color='cornflowerblue', alpha=0.3, label='stddev')
+      plt.plot(true[i,:,j], '--',color='k', label='true')
+      plt.plot(rec[i,:,j], color='red', label='reconstructed')
+      plt.legend()
+      plt.xlabel('time step')
+      plt.ylabel('velocity (m/s)')
+      f.canvas.draw()
+      buff = f.canvas.tostring_rgb()
+      ncols, nrows = f.canvas.get_width_height()
+      img = np.frombuffer(buff, dtype=np.uint8).reshape(nrows, ncols, 3)
+      plt.close(f)
+      batch.append(img)
+    states.append(batch)
+  states = np.array(states)
+  for i in range(true.shape[-1]):
+    img = np.concatenate(states[:,i],1)
+    print(name, img.shape, step)
+    tf.summary.image(name+'_'+str(i), np.expand_dims(img,0), step=step)
 
 def simulate(agent, envs, steps=0, episodes=0, state=None):
   # Initialize or unpack simulation state.

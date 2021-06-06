@@ -175,12 +175,13 @@ class Dreamer(tools.Module):
   @tf.function
   def plot_dynamics(self, data):
     # Real 
-    phy_truth = data['physics'][:6]
+    phy_truth = data['physics'][:3]
     # Initial states (5 steps warmup)
-    phy_init, _ = self._phy_dynamics.observe(data['input_phy'][:6, :5], data['action'][:6, :5])
+    phy_init, _ = self._phy_dynamics.observe(data['input_phy'][:3, :5], data['action'][:3, :5])
     phy_init_feat = self._phy_dynamics.get_feat(phy_init)
+    phy_init = {k: v[:, -1] for k, v in phy_init.items()}
     # Physics imagination
-    phy_prior = self._phy_dynamics.imagine(data['action'][:6, 5:], phy_init, sample=False)
+    phy_prior = self._phy_dynamics.imagine(data['action'][:3, 5:], phy_init, sample=False)
     phy_feat = self._phy_dynamics.get_feat(phy_prior)
     # Physics reconstruction
     phy_obs = self._physics(phy_init_feat).mode()
@@ -189,8 +190,8 @@ class Dreamer(tools.Module):
     phy_obs_std = self._physics(phy_init_feat).stddev()
     phy_pred_std = self._physics(phy_feat).stddev()
     # Concat and dump
-    phy_model = tf.concat([phy_obs[:, :5], phy_pred], 1)
-    phy_model_std = tf.concat([phy_obs_std[:, :5], phy_pred_std], 1)
+    phy_model = tf.concat([phy_obs, phy_pred], 1)
+    phy_model_std = tf.concat([phy_obs_std, phy_pred_std], 1)
     return phy_model, phy_model_std, phy_truth
 
   def _write_summaries(self):
@@ -208,11 +209,11 @@ class Dreamer(tools.Module):
     print(f'[{step}]', ' / '.join(f'{k} {v:.1f}' for k, v in metrics))
     self._writer.flush()
 
-def summarize_train(data, step, writer):
-  with writer.as_default(): 
+def summarize_train(data, agent, step):
+  with agent._writer.as_default(): 
     tf.summary.experimental.set_step(step)
     rec_phy, rec_phy_std, true_phy = agent.plot_dynamics(data)
-    tools.plot_summary('agent/dynamics_reconstruction', rec_phy, rec_phy_std, true_phy, step=step)
+    tools.plot_summary('agent/dynamics_reconstruction', np.array(rec_phy), np.array(rec_phy_std), np.array(true_phy), step=step)
 
 def preprocess(obs, config):
   dtype = prec.global_policy().compute_dtype
@@ -260,10 +261,10 @@ def main(config):
   agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'phy_dynamics_weights.pkl').exists():
     print('Loading physics_dynamics.')
-    _phy_dynamics.load(config.logdir / 'phy_dynamics_weights.pkl')
+    agent._phy_dynamics.load(config.logdir / 'phy_dynamics_weights.pkl')
   if (config.logdir / 'physics_weights.pkl').exists():
     print('Loading physics_reconstruction')
-    _phy_dynamics.load(config.logdir / 'physics_weights.pkl')
+    agent._phy_dynamics.load(config.logdir / 'physics_weights.pkl')
 
   # Train and Evaluate continously
   step = 0
@@ -276,10 +277,10 @@ def main(config):
     log = agent._should_log(step)
     for train_step in range(100):
       log_images = agent._c.log_images and log and (train_step == 0)
-      data = next(agent._dataset
+      data = next(agent._dataset)
       agent.train(data)
     if log:
-      summarize_train(data, agent._writer, step)
+      summarize_train(data, agent, step)
       agent._write_summaries()
     step += 100
 
