@@ -120,7 +120,6 @@ def plot_summary(name, rec, rec_std, true, step=None):
   states = np.array(states)
   for i in range(true.shape[-1]):
     img = np.concatenate(states[:,i],1)
-    print(name, img.shape, step)
     tf.summary.image(name+'_'+str(i), np.expand_dims(img,0), step=step)
 
 def simulate(agent, envs, steps=0, episodes=0, state=None):
@@ -458,7 +457,7 @@ def forward_sync_RSSMv2(env_dyn, phy_dyn, env_start, phy_start, policy, physics,
     indices = reversed(indices)
   for index in indices:
     new_phy = phy_dyn(phy_last, policy(env_last, phy_last), sample=False)
-    env_last = env_dyn(env_last, tf.stop_gradient(physics(phy_last)))
+    env_last = env_dyn(env_last, physics(phy_last))
     phy_last = new_phy
     [o.append(l) for o, l in zip(env_outputs, tf.nest.flatten(env_last))]
     [o.append(l) for o, l in zip(phy_outputs, tf.nest.flatten(phy_last))]

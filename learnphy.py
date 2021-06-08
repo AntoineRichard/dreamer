@@ -35,7 +35,7 @@ def define_config():
   config.seed = 0
   config.steps = 5e6
   config.eval_every = 5000
-  config.log_every = 1e3
+  config.log_every = 5e3
   config.log_scalars = True
   config.log_images = True
   config.gpu_growth = True
@@ -61,7 +61,7 @@ def define_config():
   config.cnn_depth = 32
   config.pcont = False
   config.free_nats = 3.0
-  config.kl_scale = 0.5
+  config.kl_scale = 1.5
   config.pcont_scale = 10.0
   config.weight_decay = 0.0
   config.weight_decay_pattern = r'.*'
@@ -71,7 +71,7 @@ def define_config():
   config.train_every = 1000
   config.train_steps = 100
   config.pretrain = 100
-  config.model_lr = 6e-4
+  config.model_lr = 2e-4
   config.value_lr = 8e-5
   config.actor_lr = 8e-5
   config.grad_clip = 100.0
@@ -270,7 +270,6 @@ def main(config):
   step = 0
   while step < config.steps:
     plt.close('all')
-    print('Training for 100 steps')
     agent._step.assign(step)
     step = agent._step.numpy().item()
     tf.summary.experimental.set_step(step)

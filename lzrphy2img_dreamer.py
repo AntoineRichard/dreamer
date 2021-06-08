@@ -40,12 +40,13 @@ def define_config():
   config.log_images = True
   config.gpu_growth = True
   config.precision = 32
+  config.port = 8080
   # Environment.
   config.task = 'dmc_walker_walk'
   config.envs = 1
   config.parallel = 'none'
   config.action_repeat = 1
-  config.time_limit = 1000
+  config.time_limit = 500
   config.prefill = 5000
   config.eval_noise = 0.0
   config.clip_rewards = 'none'
@@ -269,15 +270,17 @@ class Dreamer(tools.Module):
     # Real 
     env_truth = data['image'][:6] + 0.5
     # Initial states (5 steps warmup)
-    embed = self.encoder(data)
+    embed = self._encode(data)
     env_init, _ = self._env_dynamics.observe(embed[:6, :5], data['prev_phy'][:6, :5])
+    env_init_feat = self._env_dynamics.get_feat(env_init)
     env_init = {k: v[:, -1] for k, v in env_init.items()}
     # Environment imagination
     env_prior = self._env_dynamics.imagine(data['prev_phy'][:6, 5:], env_init) 
     env_feat = self._env_dynamics.get_feat(env_prior)
     # Environment reconstruction
+    env_obs = self._decode(env_init_feat).mode()
     openl = self._decode(env_feat).mode()
-    env_model = tf.concat([env_rec[:, :5] + 0.5, openl + 0.5], 1)
+    env_model = tf.concat([env_obs[:, :5] + 0.5, openl + 0.5], 1)
     error = (env_model - env_truth + 1) / 2
     openl = tf.concat([env_truth, env_model, error], 2)
     return openl
@@ -285,12 +288,13 @@ class Dreamer(tools.Module):
   @tf.function
   def plot_dynamics(self, data):
     # Real 
-    phy_truth = data['physics'][:6]
+    phy_truth = data['physics'][:3]
     # Initial states (5 steps warmup)
-    phy_init, _ = self._phy_dynamics.observe(data['input_phy'][:6, :5], data['action'][:6, :5])
+    phy_init, _ = self._phy_dynamics.observe(data['input_phy'][:3, :5], data['action'][:3, :5])
     phy_init_feat = self._phy_dynamics.get_feat(phy_init)
+    phy_init = {k: v[:, -1] for k, v in phy_init.items()}
     # Physics imagination
-    phy_prior = self._phy_dynamics.imagine(data['action'][:6, 5:], phy_init, sample=False)
+    phy_prior = self._phy_dynamics.imagine(data['action'][:3, 5:], phy_init, sample=False)
     phy_feat = self._phy_dynamics.get_feat(phy_prior)
     # Physics reconstruction
     phy_obs = self._physics(phy_init_feat).mode()
@@ -299,8 +303,8 @@ class Dreamer(tools.Module):
     phy_obs_std = self._physics(phy_init_feat).stddev()
     phy_pred_std = self._physics(phy_feat).stddev()
     # Concat and dump
-    phy_model = tf.concat([phy_obs[:, :5], phy_pred], 1)
-    phy_model_std = tf.concat([phy_obs_std[:, :5], phy_pred_std], 1)
+    phy_model = tf.concat([phy_obs, phy_pred], 1)
+    phy_model_std = tf.concat([phy_obs_std, phy_pred_std], 1)
     return phy_model, phy_model_std, phy_truth
 
   def _write_summaries(self):
@@ -372,12 +376,20 @@ def summarize_episode(config, datadir, writer, prefix, step):
     #if prefix == 'test':
     tools.video_summary(f'sim/{prefix}/video', episode['image'][None], step=step)
 
-def summarize_train(data, step, writer):
-  with writer.as_default(): 
+def summarize_train(data, agent, step):
+  with agent._writer.as_default(): 
     tf.summary.experimental.set_step(step)
-    tools.video_summary('agent/environment_reconstruction',agent.image_summaries(data),step = step)
+    tools.video_summary('agent/environment_reconstruction',np.array(agent.image_summaries(data)),step = step)
     rec_phy, rec_phy_std, true_phy = agent.plot_dynamics(data)
-    tools.plot_summary('agent/dynamics_reconstruction', rec_phy, rec_phy_std, true_phy, step=step)
+    tools.plot_summary('agent/dynamics_reconstruction', np.array(rec_phy), np.array(rec_phy_std), np.array(true_phy), step=step)
+
+def get_last_episode_reward(config, datadir, writer):
+  list_of_files = glob.glob(str(datadir)+'/*.npz')
+  latest_file = max(list_of_files, key=os.path.getctime)
+  episode = np.load(latest_file)
+  episode = {k: episode[k] for k in episode.keys()}
+  ret = float(episode['reward'][-int(len(episode['reward'])/2):].sum())
+  return ret
 
 def make_env(config, writer, prefix, datadir, store):
   suite, task = config.task.split('_', 1)
@@ -425,13 +437,13 @@ def main(config):
 
   has_trained = False
   
-  steps = count_steps(datadir, config)
-  # Warm Up
-  if steps < 100:
-    c = http.client.HTTPConnection('localhost', 8080)
-    c.request('POST', '/toServer', '{"random": 1, "steps":250, "repeat":4, "discount":1.0, "training": 1}')
-    doc = c.getresponse().read()
   step = count_steps(datadir, config)
+  # Warm Up
+  if step < 2000:
+    c = http.client.HTTPConnection('localhost', config.port)
+    c.request('POST', '/toServer', '{"random": 1, "steps":'+str(config.time_limit)+', "repeat":4, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(-10000)+'}')
+    doc = c.getresponse().read()
+
   agent = Dreamer(config, datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Loading checkpoint.')
@@ -444,16 +456,15 @@ def main(config):
     print('Loading physics_reconstruction')
     agent._physics.load(config.logdir / 'physics_weights.pkl')
 
-  training = True
-
   # Train and Evaluate continously
   while step < config.steps:
     plt.close('all')
     step = count_steps(datadir, config)
+    reward = get_last_episode_reward(config, datadir, writer)
     if (step % config.eval_every == 0) and (has_trained):
       print('Evaluating')
-      c = http.client.HTTPConnection('localhost', 8080)
-      c.request('POST', '/toServer', '{"random": 0, "steps":500, "repeat":0, "discount":1.0, "training": 0}')
+      c = http.client.HTTPConnection('localhost', config.port)
+      c.request('POST', '/toServer', '{"random": 0, "steps":'+str(config.time_limit)+', "repeat":0, "discount":1.0, "training": 0, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
       doc = c.getresponse().read()
       summarize_episode(config, datadir, agent._writer, 'train', step)
       summarize_episode(config, testdir, agent._writer, 'test', step)
@@ -469,7 +480,7 @@ def main(config):
       data = next(agent._dataset)
       agent.train(data)
     if log:  
-      summarize_train(data, agent._writer, step)
+      summarize_train(data, agent, step)
       agent._write_summaries()
     has_trained=True
 
@@ -482,8 +493,8 @@ def main(config):
 
     # Request a new episode from ROS
     print('Playing')
-    c = http.client.HTTPConnection('localhost', 8080)
-    c.request('POST', '/toServer', '{"random": 0, "steps":250, "repeat":0, "discount":1.0, "training": 1}')
+    c = http.client.HTTPConnection('localhost', config.port)
+    c.request('POST', '/toServer', '{"random": 0, "steps":'+str(config.time_limit)+', "repeat":0, "discount":1.0, "training": 1, "current_step":'+str(step)+', "reward":'+str(reward)+'}')
     doc = c.getresponse().read()
 
 if __name__ == '__main__':
