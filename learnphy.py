@@ -60,8 +60,8 @@ def define_config():
   config.cnn_act = 'relu'
   config.cnn_depth = 32
   config.pcont = False
-  config.free_nats = 3.0
-  config.kl_scale = 1.5
+  config.free_nats = 1.5
+  config.kl_scale = 1.0
   config.pcont_scale = 10.0
   config.weight_decay = 0.0
   config.weight_decay_pattern = r'.*'

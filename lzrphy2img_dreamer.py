@@ -490,6 +490,7 @@ def main(config):
     agent._decode.save(os.path.join(config.logdir,'decoder_weights.pkl'))
     agent._env_dynamics.save(os.path.join(config.logdir,'env_dynamics_weights.pkl'))
     agent._actor.save(os.path.join(config.logdir,'actor_weights.pkl'))
+    agent._reward.save(os.path.join(config.logdir,'reward_weights.pkl'))
 
     # Request a new episode from ROS
     print('Playing')
